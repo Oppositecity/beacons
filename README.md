@@ -23,35 +23,40 @@ With [M5Launcher](https://github.com/bmorcelli/Launcher): open WebUI on the devi
 | loudness, brightness, ring length | signal strength |
 | timbre | the kind of signal |
 
+Each layer's loudness is fixed, so loudness only ever means signal strength.
+
 ## Layers
 
 | key | layer | what it hears | timbre |
 |---|---|---|---|
-| `1` | beacons | WiFi access points announcing themselves, each on its own clock | marimba |
+| `1` | aps | WiFi access points announcing themselves, each on its own clock | marimba |
 | `2` | probes | phones calling for networks they remember | kalimba, an octave up |
-| `3` | traffic | WiFi data frames; every Nth frame sounds, ringing longer for bigger frames | vibraphone |
+| `3` | data | WiFi data frames; every Nth frame sounds, ringing longer for bigger frames | vibraphone |
 | `4` | floor | the radio noise floor, and how many devices are present | drone: loudness = noise floor, one harmonic per device present |
 | `5` | deauth | disconnect frames (rare; often an attack) | a struck bell |
-| `6` | bluetooth | BLE devices advertising nearby | tongue drum, low register |
+| `6` | ble | Bluetooth devices advertising nearby | tongue drum, low register |
 
 Pitches stay between 110 and 2000 Hz, the output runs through a soft limiter, and volume is capped.
 
+## The screen
+
+Every mark is a measurement.
+
+- **Rows:** the nearest sources, up to three WiFi and three Bluetooth, closest (highest pitch) at the top. A row flashes when it sounds, the bar is signal strength, and `+` / `-` means approaching / receding. `?` = probe, `*` = Bluetooth.
+- **Layer labels:** each layer's key, name and a live count: access points present, phones probing, data frames per second, noise floor in dBm, disconnects heard, Bluetooth devices present. UPPERCASE = on. A label flashes when its layer sounds.
+- **Bottom line:** channel and its frequency in MHz, hop, thinning, volume, mute (`M` when muted).
+
 ## Keys
-
-Both screens: `1`-`6` layer on/off, `tab` switch between play and mixer, `m` mute, `q` sleep (reset to wake).
-
-Play screen:
 
 | key | does |
 |---|---|
+| `1`-`6` | layer on / off |
 | `,` `/` | WiFi channel down / up |
 | `h` | hop through all channels |
 | `[` `]` | thin / thicken how often each source sounds |
 | `-` `=` | volume |
-
-Mixer screen: `;` `.` select a layer, `-` `=` set its level.
-
-On the play screen, the six nearest sources are listed with the closest (highest) at the top; the bar is signal strength and `+` / `-` means approaching / receding.
+| `m` | mute |
+| `q` | sleep (reset to wake) |
 
 ## Build
 

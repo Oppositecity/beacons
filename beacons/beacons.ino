@@ -1,4 +1,4 @@
-// BEACONS v0.9 — listening to the air, for M5Stack Cardputer (original + ADV)
+// BEACONS v1.0 — listening to the air, for M5Stack Cardputer (original + ADV)
 //
 // Nothing here is composed. Every sound is a measurement:
 //   when a note sounds  = the moment a signal arrives
@@ -21,15 +21,19 @@
 //
 // Pitches stay within 110–2000 Hz, the output passes a soft limiter, and volume is capped.
 //
-// Two screens, switched with tab:
-//   play   up to six sources as rows, highest pitch (closest) at top; a row flashes when it sounds,
-//          the bar is signal strength, + / - at the end = approaching / receding.
-//          ? = probe, * = bluetooth.
-//   mixer  the six layers; UPPERCASE = on, the bar is level, a row flashes when that layer sounds.
+// Each layer's loudness is fixed, so loudness only ever means signal strength.
 //
-// keys (both screens):  1-6 layer on/off   tab switch screen   m mute   q sleep (reset to wake)
-// play screen:          , / channel   h hop channels   [ ] thin/thicken   - = volume
-// mixer screen:         ; . select layer   - = layer level
+// One screen, every mark a measurement:
+//   rows    the nearest sources: up to three WiFi and three bluetooth, highest pitch (closest)
+//           at top. A row flashes when it sounds; the bar is signal strength; + / - at the end
+//           = approaching / receding. ? = probe, * = bluetooth.
+//   below   each layer with its key and a live count: access points present, phones probing,
+//           data frames per second, noise floor in dBm, disconnects heard, bluetooth devices
+//           present. UPPERCASE = layer on. A label flashes when its layer sounds.
+//   bottom  channel and its frequency, hop, thinning, volume, mute.
+//
+// keys:  1-6 layer on/off   , / channel   h hop channels   [ ] thin/thicken   - = volume
+//        m mute   q sleep (reset to wake)
 //
 // Nothing is stored or transmitted. Listening only.
 
@@ -58,9 +62,9 @@ struct Voice {
 // =====================================================================
 //  layers and controls
 // =====================================================================
-static const char* LAYER_NAMES[NLAYERS] = {"beacons", "probes", "traffic", "floor", "deauth", "bluetooth"};
+static const char* LAYER_TAGS[NLAYERS] = {"aps", "probes", "data", "floor", "deauth", "ble"};
 static bool     layerOn[NLAYERS]    = {true, true, true, true, true, true};
-static int      layerLvl[NLAYERS]   = {7, 5, 5, 4, 6, 6};     // 0..10
+static const float CAL[NLAYERS]     = {0.7f, 0.5f, 0.5f, 0.4f, 0.6f, 0.6f};   // fixed balance between layers
 static uint32_t layerFlash[NLAYERS] = {0};
 
 static int  channel  = 6;
@@ -69,10 +73,10 @@ static bool hopping  = false;
 static int  volume   = 120;
 static const int VOL_MAX = 200;                // hard cap for ears and equipment
 static int  divIdx   = 3;
-static bool mixerView = false;
-static int  sel      = 0;
 static const int DIVS[] = {1, 2, 5, 10, 20, 50};
 static int  present  = 0;                      // devices heard in the last 5 s
+static int  presentKind[3] = {0, 0, 0};        // access points, probing phones, bluetooth
+static int  dataRate = 0;                      // data frames per second
 
 // =====================================================================
 //  radio -> loop event queue
@@ -301,7 +305,7 @@ static void synthTask(void*) {
 // =====================================================================
 //  sources on screen: one per device heard
 // =====================================================================
-static const int NV = 32;
+static const int NV = 48;
 static Voice voices[NV];
 
 M5Canvas canvas(&M5Cardputer.Display);
@@ -346,7 +350,7 @@ static void setChannel(int ch) {
   for (int i = 0; i < NV; i++) if (voices[i].kind != 2) voices[i].used = false;
 }
 
-static float lvl(int L) { return layerOn[L] ? layerLvl[L] / 10.0f : 0.0f; }
+static float lvl(int L) { return layerOn[L] ? CAL[L] : 0.0f; }
 
 static void goToSleep() {
   esp_wifi_set_promiscuous(false);
@@ -365,46 +369,69 @@ static void goToSleep() {
 static void handleKeys() {
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
   auto ks = M5Cardputer.Keyboard.keysState();
-  if (ks.tab) mixerView = !mixerView;
   for (char c : ks.word) {
-    if (c >= '1' && c <= '6') { layerOn[c - '1'] = !layerOn[c - '1']; continue; }
-    if (c == 'q') goToSleep();
+    if (c >= '1' && c <= '6') layerOn[c - '1'] = !layerOn[c - '1'];
+    else if (c == 'q') goToSleep();
     else if (c == 'm') muted = !muted;
-    else if (mixerView) {
-      if (c == ';') sel = (sel + NLAYERS - 1) % NLAYERS;
-      else if (c == '.') sel = (sel + 1) % NLAYERS;
-      else if (c == '=') layerLvl[sel] = min(layerLvl[sel] + 1, 10);
-      else if (c == '-') layerLvl[sel] = max(layerLvl[sel] - 1, 0);
-    } else {
-      if (c == '/') setChannel(channel % 13 + 1);
-      else if (c == ',') setChannel((channel + 11) % 13 + 1);
-      else if (c == 'h') hopping = !hopping;
-      else if (c == '[') divIdx = min(divIdx + 1, 5);
-      else if (c == ']') divIdx = max(divIdx - 1, 0);
-      else if (c == '=') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
-      else if (c == '-') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
-    }
+    else if (c == '/') setChannel(channel % 13 + 1);
+    else if (c == ',') setChannel((channel + 11) % 13 + 1);
+    else if (c == 'h') hopping = !hopping;
+    else if (c == '[') divIdx = min(divIdx + 1, 5);
+    else if (c == ']') divIdx = max(divIdx - 1, 0);
+    else if (c == '=') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
+    else if (c == '-') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
   }
 }
 
 // =====================================================================
-//  screens
+//  screen
 // =====================================================================
-static void drawPlay(uint32_t now) {
-  const int ROWS = 6, ROW_H = 17, BAR_X = 150, BAR_W = 76;
+// strongest alive source of one family (wifi: kinds 0 and 1, or bluetooth: kind 2) not yet taken
+static int strongest(uint32_t now, bool ble, bool* taken) {
+  int best = -1;
+  for (int i = 0; i < NV; i++) {
+    Voice& v = voices[i];
+    if (!v.used || taken[i] || now - v.seen > 5000 || (v.kind == 2) != ble) continue;
+    int L = v.kind == 0 ? L_BEACON : (v.kind == 1 ? L_PROBE : L_BLE);
+    if (!layerOn[L]) continue;
+    if (best < 0 || v.rssi > voices[best].rssi) best = i;
+  }
+  return best;
+}
+
+// one layer label: key, name (UPPERCASE = on), live count; inverted while that layer sounds
+static int drawTag(int x, int y, int L, const char* count, uint32_t now) {
+  char name[12], t[32];
+  strcpy(name, LAYER_TAGS[L]);
+  if (layerOn[L]) for (char* c = name; *c; c++) *c = toupper(*c);
+  snprintf(t, sizeof(t), "%d %s %s", L + 1, name, count);
+  int w = strlen(t) * 6;
+  bool lit = layerOn[L] && now - layerFlash[L] < 140;
+  if (lit) canvas.fillRect(x - 1, y - 1, w + 2, 9, TFT_WHITE);
+  canvas.setTextColor(lit ? TFT_BLACK : TFT_WHITE);
+  canvas.drawString(t, x, y);
+  return x + w + 12;
+}
+
+static void draw() {
+  canvas.fillSprite(TFT_BLACK);
+  uint32_t now = millis();
+  const int ROWS = 6, ROW_H = 16, BAR_X = 150, BAR_W = 76;
+
+  // rows: up to three of each family, so neither can crowd the other out
   int pick[ROWS], np = 0;
   bool taken[NV] = {false};
-  for (int r = 0; r < ROWS; r++) {
-    int best = -1;
-    for (int i = 0; i < NV; i++) {
-      Voice& v = voices[i];
-      if (!v.used || taken[i] || now - v.seen > 5000) continue;
-      int L = v.kind == 0 ? L_BEACON : (v.kind == 1 ? L_PROBE : L_BLE);
-      if (!layerOn[L]) continue;
-      if (best < 0 || v.rssi > voices[best].rssi) best = i;
+  for (int fam = 0; fam < 2; fam++)
+    for (int r = 0; r < 3; r++) {
+      int b = strongest(now, fam == 1, taken);
+      if (b < 0) break;
+      taken[b] = true; pick[np++] = b;
     }
-    if (best < 0) break;
-    taken[best] = true; pick[np++] = best;
+  while (np < ROWS) {                                   // fill leftover rows from whichever family has more
+    int b0 = strongest(now, false, taken), b1 = strongest(now, true, taken);
+    int b = b0 < 0 ? b1 : (b1 < 0 ? b0 : (voices[b0].rssi >= voices[b1].rssi ? b0 : b1));
+    if (b < 0) break;
+    taken[b] = true; pick[np++] = b;
   }
   for (int a = 0; a < np; a++)
     for (int b = a + 1; b < np; b++)
@@ -413,7 +440,7 @@ static void drawPlay(uint32_t now) {
   canvas.setFont(&fonts::FreeMono9pt7b);
   for (int r = 0; r < np; r++) {
     Voice& v = voices[pick[r]];
-    int y = 2 + r * ROW_H;
+    int y = 1 + r * ROW_H;
     bool lit = (now - v.flash < 140);
     uint16_t fg = lit ? TFT_BLACK : TFT_WHITE;
     if (lit) canvas.fillRect(0, y - 1, 240, ROW_H - 1, TFT_WHITE);
@@ -427,46 +454,25 @@ static void drawPlay(uint32_t now) {
     if (fabsf(trend) > 1.5f) canvas.drawString(trend > 0 ? "+" : "-", 229, y);
   }
 
+  // layers with live counts
   canvas.setFont(&fonts::Font0);
-  canvas.setTextColor(TFT_WHITE);
-  char l1[48], l2[48], l3[48];
-  snprintf(l1, sizeof(l1), ",/ ch%d %dMHz  h %s  f0 %dHz", channel, 2407 + 5 * channel, hopping ? "HOP" : "hop", (int)fundamental());
-  snprintf(l2, sizeof(l2), "[] /%d  -= vol%d  %d here  floor%d", DIVS[divIdx], volume, present, noiseFloor);
-  snprintf(l3, sizeof(l3), "tab mixer  1-6 layers  m %s  q sleep", muted ? "MUTED" : "mute");
-  canvas.drawString(l1, 4, 104);
-  canvas.drawString(l2, 4, 114);
-  canvas.drawString(l3, 4, 124);
-}
+  char c[6][12];
+  snprintf(c[0], 12, "%d", presentKind[0]);
+  snprintf(c[1], 12, "%d", presentKind[1]);
+  snprintf(c[2], 12, "%d/s", dataRate);
+  snprintf(c[3], 12, "%d", noiseFloor);
+  snprintf(c[4], 12, "%u", (unsigned)deauthCount);
+  snprintf(c[5], 12, "%d", presentKind[2]);
+  int x = 4;
+  for (int L = 0; L < 3; L++) x = drawTag(x, 102, L, c[L], now);
+  x = 4;
+  for (int L = 3; L < 6; L++) x = drawTag(x, 113, L, c[L], now);
 
-static void drawMixer(uint32_t now) {
-  const int ROW_H = 16, BAR_X = 150;
-  canvas.setFont(&fonts::FreeMono9pt7b);
-  for (int L = 0; L < NLAYERS; L++) {
-    int y = 2 + L * ROW_H;
-    bool lit = layerOn[L] && (now - layerFlash[L] < 140);
-    uint16_t fg = lit ? TFT_BLACK : TFT_WHITE;
-    if (lit) canvas.fillRect(0, y - 1, 240, ROW_H, TFT_WHITE);
-    canvas.setTextColor(fg);
-    char name[16];
-    strcpy(name, LAYER_NAMES[L]);
-    if (layerOn[L]) for (char* c = name; *c; c++) *c = toupper(*c);
-    char row[24];
-    snprintf(row, sizeof(row), "%c%d %s", sel == L ? '>' : ' ', L + 1, name);
-    canvas.drawString(row, 2, y);
-    canvas.fillRect(BAR_X, y + 5, layerLvl[L] * 8 + 2, 4, fg);
-  }
-  canvas.setFont(&fonts::Font0);
   canvas.setTextColor(TFT_WHITE);
-  char l2[48];
-  snprintf(l2, sizeof(l2), "tab play  m %s  q sleep", muted ? "MUTED" : "mute");
-  canvas.drawString("1-6 on/off   ;. select   -= level", 4, 112);
-  canvas.drawString(l2, 4, 124);
-}
-
-static void draw() {
-  canvas.fillSprite(TFT_BLACK);
-  uint32_t now = millis();
-  if (mixerView) drawMixer(now); else drawPlay(now);
+  char l3[48];
+  snprintf(l3, sizeof(l3), ",/ ch%d %d  h %s  [] /%d  -= %d %s q",
+           channel, 2407 + 5 * channel, hopping ? "HOP" : "hop", DIVS[divIdx], volume, muted ? "M" : "m");
+  canvas.drawString(l3, 4, 125);
   canvas.pushSprite(0, 0);
 }
 
@@ -557,9 +563,14 @@ void loop() {
   static uint32_t lastCount = 0;
   if (now - lastCount > 250) {
     lastCount = now;
-    int n = 0;
-    for (int i = 0; i < NV; i++) if (voices[i].used && now - voices[i].seen < 5000) n++;
+    int n = 0, k[3] = {0, 0, 0};
+    for (int i = 0; i < NV; i++) if (voices[i].used && now - voices[i].seen < 5000) { n++; k[voices[i].kind]++; }
     present = n;
+    for (int j = 0; j < 3; j++) presentKind[j] = k[j];
+    static uint32_t lastRateCount = 0;
+    uint32_t dcNow = dataCount;
+    dataRate = (dataRate + (int)((dcNow - lastRateCount) * 4)) / 2;   // frames per second, lightly smoothed
+    lastRateCount = dcNow;
   }
   float nf = constrain((noiseFloor + 100) / 20.0f, 0.0f, 1.0f);
   droneF0 = fundamental();

@@ -1,8 +1,8 @@
 # BEACONS
 
-The air around you as a small orchestra. An M5Stack Cardputer (original or ADV) piece that listens to WiFi and Bluetooth and turns what it hears into warm, struck, natural sound.
+The air around you as a small band. An M5Stack Cardputer (original or ADV) piece that listens to WiFi and Bluetooth and turns what it hears into warm, struck, harmonic music.
 
-Every access point announces itself about ten times a second, each on its own slightly drifting clock. BEACONS gives every device a fixed pitch and lets those clocks phase against each other, while the busier layers of the air arrive as rain, surf and birdsong.
+Everything plays in one key, on one tempo grid, over a slowly turning chord progression. Every device gets a fixed role in the chord, and every access point keeps its own slightly drifting clock, so the clocks phase against each other as rhythm.
 
 Nothing is stored, logged, or transmitted. It only listens.
 
@@ -14,17 +14,17 @@ With [M5Launcher](https://github.com/bmorcelli/Launcher): open WebUI on the devi
 
 ## Layers
 
-| key | layer | what it hears | how it sounds |
+| key | layer | what it hears | its part in the band |
 |---|---|---|---|
-| `1` | beacons | WiFi access points announcing themselves | marimba |
-| `2` | probes | phones calling for networks they remember | kalimba |
-| `3` | traffic | WiFi data volume on the current channel | rain |
-| `4` | floor | the radio noise floor | low drone, like surf |
-| `5` | deauth | disconnect frames (rare; often an attack) | birdsong |
-| `6` | bluetooth | BLE devices advertising nearby | tongue drum |
-| `7` | motion | shaking the Cardputer (ADV motion sensor) | rainstick |
+| `1` | beacons | WiFi access points announcing themselves | marimba, middle voices |
+| `2` | probes | phones calling for networks they remember | kalimba, high voices |
+| `3` | traffic | WiFi data volume on the current channel | vibraphone arpeggio; busier air, busier arpeggio |
+| `4` | floor | the radio noise floor | drone on the chord root, gliding with each change |
+| `5` | deauth | disconnect frames (rare; often an attack) | a struck bell chord |
+| `6` | bluetooth | BLE devices advertising nearby | tongue drum bass, roots and fifths |
+| `7` | motion | shaking the Cardputer (ADV motion sensor) | a strummed chord |
 
-All synthesis is modal (struck-bar physics with natural decays). Pitches are kept between 130 and 2600 Hz, the output runs through a soft limiter, and volume is capped.
+All synthesis is modal (struck-bar physics with natural decays). Pitches stay between 130 and 2000 Hz, the output runs through a soft limiter, and volume is capped.
 
 ## Keys
 
@@ -37,9 +37,10 @@ Play screen:
 | `,` `/` | WiFi channel down / up |
 | `h` | hop through all channels |
 | `;` `.` | octave up / down |
-| `s` | scale: pentatonic, harmonic series, whole-tone, chromatic |
+| `t` | tempo: 60, 72, 84, 96, 108 |
+| `s` | mood: major, dorian, lydian, minor progressions |
 | `l` | note length |
-| `[` `]` | thin / thicken how often each device sounds |
+| `[` `]` | thin / thicken how often each device plays |
 | `-` `=` | volume |
 
 Mixer screen: `;` `.` select a layer, `-` `=` set its level.

@@ -1,16 +1,16 @@
-// BEACONS v0.7 — the air around you as a small band, for M5Stack Cardputer (original + ADV)
+// BEACONS v0.8 — the air around you as a small band, for M5Stack Cardputer (original + ADV)
 //
-// Everything plays in one key, on one tempo grid, over a slowly turning chord progression.
-// Each signal the radio hears takes a musical role:
+// Everything plays in one key over a slowly turning chord progression, and every note sounds
+// the moment its signal arrives. Each signal the radio hears takes a musical role:
 //   1 beacons    WiFi access points announcing themselves   -> marimba, middle voices
 //   2 probes     phones calling for networks they remember  -> kalimba, high voices
-//   3 traffic    WiFi data volume on this channel           -> vibraphone arpeggio (busier air, busier arpeggio)
+//   3 traffic    WiFi data frames on this channel           -> vibraphone arpeggio, a note every Nth frame
 //   4 floor      the radio noise floor                      -> drone on the chord root, gliding with each change
 //   5 deauth     disconnect frames (rare; often an attack)  -> a struck bell chord
 //   6 bluetooth  BLE devices advertising nearby             -> tongue drum bass, roots and fifths
 //   7 motion     shaking the Cardputer (ADV motion sensor)  -> a strummed chord
-// Notes land on 16th-note steps; each device's own clock decides which steps it plays,
-// so their drifting clocks become phasing rhythm.
+// Access points keep their own drifting clocks, so their pulses phase against each other.
+// Tempo sets how fast the chords change.
 //
 // Synthesis is modal (struck-bar physics, natural decays, soft onsets). Pitches stay within
 // 130–2000 Hz, the output passes a soft limiter, and volume is capped.
@@ -21,7 +21,7 @@
 //   mixer  the seven layers; UPPERCASE = on, the bar is level, a row flashes when that layer sounds.
 //
 // keys (both screens):  1-7 layer on/off   tab switch screen   m mute   q sleep (reset to wake)
-// play screen:          , / channel   h hop   ; . octave   t tempo   s mood (chord progression)
+// play screen:          , / channel   h hop   ; . octave   t chord tempo   s mood (chord progression)
 //                       l note length   [ ] thin/thicken   - = volume
 // mixer screen:         ; . select layer   - = layer level
 //
@@ -293,20 +293,26 @@ static void synthTask(void*) {
 }
 
 // =====================================================================
-//  the grid: every note waits for its 16th-note step
+//  notes sound the moment their signal arrives; a short memory keeps
+//  identical notes from stacking and caps how many start at once
 // =====================================================================
 static const int NS = 48;
 static Sched sched[NS];
+static const int NRECENT = 16;
+static float recentF[NRECENT];
+static uint32_t recentT[NRECENT];
+static int recentI = 0;
 
 static void schedule(uint32_t at, float f, float amp, uint8_t timbre, float len, uint8_t layer, int16_t voice) {
   if (amp <= 0 || muted) return;
-  int onStep = 0;
-  for (int i = 0; i < NS; i++) {
-    if (!sched[i].used || sched[i].at != at) continue;
-    if (fabsf(sched[i].f - f) < 1.0f) return;         // same pitch on the same step: once is enough
-    onStep++;
+  int crowd = 0;
+  for (int i = 0; i < NRECENT; i++) {
+    if (at - recentT[i] > 60 || recentT[i] > at) continue;
+    if (fabsf(recentF[i] - f) < 1.0f) return;         // the same pitch twice within 60 ms: once is enough
+    crowd++;
   }
-  if (onStep >= 5) return;                            // at most five notes per step, so it never smears
+  if (crowd >= 5) return;                             // at most five notes starting together, so it never smears
+  recentF[recentI] = f; recentT[recentI] = at; recentI = (recentI + 1) % NRECENT;
   for (int i = 0; i < NS; i++)
     if (!sched[i].used) { sched[i] = {at, f, amp, len, timbre, layer, voice, true}; return; }
 }
@@ -522,11 +528,11 @@ void loop() {
   handleKeys();
   uint32_t now = millis();
 
-  uint32_t stepMs = 60000 / TEMPOS[tempoIdx] / 4;           // one 16th note
+  uint32_t stepMs = 60000 / TEMPOS[tempoIdx] / 4;           // one 16th note; chords change every 32
   uint32_t step = now / stepMs;
-  uint32_t nextStep = (step + 1) * stepMs;
+  chordIdx = (step / 32) % 4;
 
-  // radio events -> notes on the next step
+  // radio events -> notes, right now
   Ev e;
   int budget = 32;
   while (budget-- && popEv(e)) {
@@ -538,53 +544,51 @@ void loop() {
     float f = pitchFor(v.mac, v.kind);
     if (e.kind == 0) {
       if (++v.n % DIVS[divIdx]) continue;                  // each AP on its own real clock, thinned
-      schedule(nextStep, f, (0.05f + 0.22f * near) * lvl(L_BEACON), T_MARIMBA, LENS[lenIdx], L_BEACON, vi);
+      schedule(now, f, (0.05f + 0.22f * near) * lvl(L_BEACON), T_MARIMBA, LENS[lenIdx], L_BEACON, vi);
     } else if (e.kind == 1) {
       if (now - v.lastSound < 600) continue;
-      schedule(nextStep, f, 0.12f * lvl(L_PROBE), T_KALIMBA, LENS[lenIdx], L_PROBE, vi);
+      schedule(now, f, 0.12f * lvl(L_PROBE), T_KALIMBA, LENS[lenIdx], L_PROBE, vi);
     } else {
       if (now - v.lastSound < 120u * DIVS[divIdx]) continue;
-      schedule(nextStep, f, (0.06f + 0.2f * near) * lvl(L_BLE), T_TONGUE, LENS[lenIdx], L_BLE, vi);
+      schedule(now, f, (0.06f + 0.2f * near) * lvl(L_BLE), T_TONGUE, LENS[lenIdx], L_BLE, vi);
     }
     v.lastSound = now;
   }
 
-  // once per step: chord, arpeggio, drone, bell
-  static uint32_t lastStep = 0, lastData = 0, lastDeauth = 0, lastBell = 0, lastStrum = 0;
-  static float trafficRate = 0, shake = 0;
+  // traffic: one arpeggio note every Nth data frame, the moment that frame arrives
+  static uint32_t lastData = 0, lastArp = 0, lastDeauth = 0, lastBell = 0, lastStrum = 0;
+  static float shake = 0;
   static int arp = 0;
-  if (step != lastStep) {
-    uint32_t elapsed = (step - lastStep) * stepMs;
-    lastStep = step;
-    chordIdx = (step / 32) % 4;                              // new chord every two bars
-
-    uint32_t dc = dataCount;
-    float perSec = elapsed ? (dc - lastData) * 1000.0f / elapsed : 0; lastData = dc;
-    trafficRate += (perSec - trafficRate) * 0.25f;
-    float pArp = min(0.85f, trafficRate / 1200.0f) * (layerOn[L_TRAFFIC] ? 1.0f : 0.0f);
-    if ((esp_random() % 1000) < pArp * 1000) {                // busier air, busier arpeggio
+  uint32_t dc = dataCount;
+  uint32_t framesPerNote = 8 * DIVS[divIdx];
+  if (dc - lastData >= framesPerNote) {
+    lastData = dc - (dc - lastData) % framesPerNote;
+    if (layerOn[L_TRAFFIC] && now - lastArp >= 90) {
       static const int ARP[8] = {0, 1, 2, 3, 2, 1, 3, 2};
       int i = ARP[arp % 8]; int up = (arp / 8) % 2 ? 12 : 0; arp++;
       float f = fold(semi(chordTone(i) + 12 + up), 260, 1400);
-      schedule(nextStep, f, 0.11f * lvl(L_TRAFFIC), T_VIBES, LENS[lenIdx], L_TRAFFIC, -1);
+      schedule(now, f, 0.11f * lvl(L_TRAFFIC), T_VIBES, LENS[lenIdx], L_TRAFFIC, -1);
+      lastArp = now;
     }
+  }
 
-    float nf = constrain((noiseFloor + 97) / 15.0f, 0.0f, 1.0f);
-    droneRoot = fold(semi(chordTone(0)), 130, 260);
-    droneTarget = muted ? 0 : (0.6f + 0.4f * nf) * 0.05f * lvl(L_FLOOR);
-    static int lastNf = -95;                                  // the floor row flashes when the noise floor shifts
-    if (abs(noiseFloor - lastNf) >= 2) { lastNf = noiseFloor; if (layerOn[L_FLOOR]) layerFlash[L_FLOOR] = now; }
+  // floor: the drone follows the chord root and swells with the noise floor
+  float nf = constrain((noiseFloor + 97) / 15.0f, 0.0f, 1.0f);
+  droneRoot = fold(semi(chordTone(0)), 130, 260);
+  droneTarget = muted ? 0 : (0.6f + 0.4f * nf) * 0.05f * lvl(L_FLOOR);
+  static int lastNf = -95;                                    // the floor row flashes when the noise floor shifts
+  if (abs(noiseFloor - lastNf) >= 2) { lastNf = noiseFloor; if (layerOn[L_FLOOR]) layerFlash[L_FLOOR] = now; }
 
-    uint32_t dd = deauthCount;
-    if (dd != lastDeauth) {
-      lastDeauth = dd;
-      if (layerOn[L_DEAUTH] && now - lastBell > 4000) {     // a struck bell chord: root, fifth, octave
-        float a = 0.07f * lvl(L_DEAUTH);
-        schedule(nextStep, fold(semi(chordTone(0) + 12), 196, 700), a, T_BELL, 1.0f, L_DEAUTH, -1);
-        schedule(nextStep, fold(semi(chordTone(2) + 12), 196, 1000), a * 0.8f, T_BELL, 1.0f, L_DEAUTH, -1);
-        schedule(nextStep, fold(semi(chordTone(0) + 24), 300, 1400), a * 0.6f, T_BELL, 1.0f, L_DEAUTH, -1);
-        lastBell = now;
-      }
+  // deauth: a struck bell chord the moment a disconnect frame is heard
+  uint32_t dd = deauthCount;
+  if (dd != lastDeauth) {
+    lastDeauth = dd;
+    if (layerOn[L_DEAUTH] && now - lastBell > 4000) {         // root, fifth, octave
+      float a = 0.07f * lvl(L_DEAUTH);
+      schedule(now, fold(semi(chordTone(0) + 12), 196, 700), a, T_BELL, 1.0f, L_DEAUTH, -1);
+      schedule(now, fold(semi(chordTone(2) + 12), 196, 1000), a * 0.8f, T_BELL, 1.0f, L_DEAUTH, -1);
+      schedule(now, fold(semi(chordTone(0) + 24), 300, 1400), a * 0.6f, T_BELL, 1.0f, L_DEAUTH, -1);
+      lastBell = now;
     }
   }
 
@@ -600,7 +604,7 @@ void loop() {
       float a = (0.06f + 0.05f * min(shake, 1.5f)) * lvl(L_MOTION);
       for (int i = 0; i < 6; i++) {
         float f = fold(semi(chordTone(i % 4) + 12 + 12 * (i / 4)), 196, 1400);
-        schedule(nextStep + i * 45, f, a, T_KALIMBA, 1.2f, L_MOTION, -1);
+        schedule(now + i * 45, f, a, T_KALIMBA, 1.2f, L_MOTION, -1);
       }
       lastStrum = now;
     }

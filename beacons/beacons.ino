@@ -1,4 +1,4 @@
-// BEACONS v1.0 — listening to the air, for M5Stack Cardputer (original + ADV)
+// BEACONS v1.1 — listening to the air, for M5Stack Cardputer (original + ADV)
 //
 // Nothing here is composed. Every sound is a measurement:
 //   when a note sounds  = the moment a signal arrives
@@ -8,16 +8,22 @@
 //   its bend            = whether it's getting closer or farther: approaching sources go slightly
 //                         sharp, receding ones flat, like a doppler shift
 //   loudness, brightness, ring length = signal strength (close = loud, bright, long)
-//   timbre              = what kind of signal it is
+//   timbre              = what kind of signal it is (the kit decides which instrument voices
+//                         which kind; it never changes pitch, timing or loudness)
 //
-//   1 beacons    WiFi access points announcing themselves      -> marimba, on each AP's own clock
-//   2 probes     phones calling for networks they remember     -> kalimba, an octave up
-//   3 traffic    WiFi data frames; every Nth frame sounds       -> vibraphone; pitch from that frame's
-//                                                                  strength, ring length from its size
-//   4 floor      the radio noise floor + how many devices      -> drone: loudness = noise floor,
-//                are present                                      one harmonic per device present (max 8)
-//   5 deauth     disconnect frames (rare; often an attack)     -> a struck bell
-//   6 bluetooth  BLE devices advertising nearby                -> tongue drum, low register
+//   1 aps     WiFi access points announcing themselves, each sounding on its own clock
+//   2 probes  phones calling for networks they remember, an octave up
+//   3 data    WiFi data frames; every Nth frame sounds, pitched by its strength, ringing by its size
+//   4 floor   the radio noise floor + devices present -> drone: loudness = noise floor,
+//             one harmonic per device present (max 8)
+//   5 deauth  disconnect frames (rare; often an attack) -> a struck bell
+//   6 ble     Bluetooth devices advertising nearby, low register
+//
+//   kits (k)  aps       probes    data        deauth  ble
+//   wood      marimba   kalimba   vibraphone  bell    tongue drum
+//   metal     gamelan   bright    glass       bell    low gong
+//   skin      drum      kalimba   woodblock   bell    low drum
+//   glass     glass     bright    vibraphone  bell    tongue drum
 //
 // Pitches stay within 110–2000 Hz, the output passes a soft limiter, and volume is capped.
 //
@@ -30,10 +36,11 @@
 //   below   each layer with its key and a live count: access points present, phones probing,
 //           data frames per second, noise floor in dBm, disconnects heard, bluetooth devices
 //           present. UPPERCASE = layer on. A label flashes when its layer sounds.
-//   bottom  channel and its frequency, hop, thinning, volume, mute.
+//   bottom  the controls with their current values. UPPERCASE = on.
 //
-// keys:  1-6 layer on/off   , / channel   h hop channels   [ ] thin/thicken   - = volume
-//        m mute   q sleep (reset to wake)
+// keys:  1-6 layer on/off
+//        a d channel down / up     s scan all channels (back and forth)     k kit
+//        f g fewer / more notes    z x volume down / up    m mute    o off (reset to wake)
 //
 // Nothing is stored or transmitted. Listening only.
 
@@ -49,7 +56,7 @@
 //  builder's auto-generated prototypes always compile
 // =====================================================================
 enum { L_BEACON, L_PROBE, L_TRAFFIC, L_FLOOR, L_DEAUTH, L_BLE, NLAYERS };
-enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_VIBES, T_BELL, NTIMBRES };
+enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_VIBES, T_BELL, T_GLASS, T_BRIGHT, T_GAMELAN, T_GONG, T_DRUM, T_BLOCK, T_LOWDRUM, NTIMBRES };
 struct Ev { uint8_t kind; uint8_t mac[6]; int8_t rssi; char name[33]; };   // kind 0 AP, 1 probe, 2 BLE
 struct Partial { float a1, a2, y1, y2, env, rblk; };
 struct Note { Partial p[3]; int np; bool active; };
@@ -70,6 +77,16 @@ static uint32_t layerFlash[NLAYERS] = {0};
 static int  channel  = 6;
 static bool muted    = false;
 static bool hopping  = false;
+static int  hopDir   = 1;
+static int  kit      = 0;
+static const char* KIT_NAMES[] = {"wood", "metal", "skin", "glass"};
+// which timbre voices each layer, per kit: aps, probes, data, floor (unused), deauth, ble
+static const uint8_t KIT[4][NLAYERS] = {
+  {T_MARIMBA, T_KALIMBA, T_VIBES, 0, T_BELL, T_TONGUE},
+  {T_GAMELAN, T_BRIGHT,  T_GLASS, 0, T_BELL, T_GONG},
+  {T_DRUM,    T_KALIMBA, T_BLOCK, 0, T_BELL, T_LOWDRUM},
+  {T_GLASS,   T_BRIGHT,  T_VIBES, 0, T_BELL, T_TONGUE},
+};
 static int  volume   = 120;
 static const int VOL_MAX = 200;                // hard cap for ears and equipment
 static int  divIdx   = 3;
@@ -179,9 +196,17 @@ static volatile int nqHead = 0, nqTail = 0;
 static portMUX_TYPE nmux = portMUX_INITIALIZER_UNLOCKED;
 
 // partial ratios, relative amplitudes, decay times (seconds to fade 60 dB)
-static const float T_RATIO[NTIMBRES][3] = {{1, 3.99f, 9.9f}, {1, 5.9f, 0}, {1, 2.0f, 3.01f}, {1, 4.0f, 0}, {1, 2.0f, 3.0f}};
-static const float T_AMP[NTIMBRES][3]   = {{1, 0.28f, 0.07f}, {1, 0.16f, 0}, {1, 0.33f, 0.09f}, {1, 0.12f, 0}, {1, 0.45f, 0.22f}};
-static const float T_T60[NTIMBRES][3]   = {{1.1f, 0.22f, 0.06f}, {1.8f, 0.25f, 0}, {1.5f, 0.5f, 0.2f}, {2.6f, 0.6f, 0}, {3.5f, 2.0f, 1.2f}};
+// marimba, kalimba, tongue drum, vibraphone, bell, glass, bright glass, gamelan bar (free-bar modes),
+// low gong, drum (membrane modes), woodblock, low drum
+static const float T_RATIO[NTIMBRES][3] = {
+  {1, 3.99f, 9.9f}, {1, 5.9f, 0}, {1, 2.0f, 3.01f}, {1, 4.0f, 0}, {1, 2.0f, 3.0f}, {1, 3.0f, 0},
+  {1, 2.0f, 0}, {1, 2.76f, 5.40f}, {1, 2.76f, 0}, {1, 1.59f, 2.14f}, {1, 2.57f, 0}, {1, 1.59f, 2.14f}};
+static const float T_AMP[NTIMBRES][3]   = {
+  {1, 0.28f, 0.07f}, {1, 0.16f, 0}, {1, 0.33f, 0.09f}, {1, 0.12f, 0}, {1, 0.45f, 0.22f}, {1, 0.06f, 0},
+  {1, 0.10f, 0}, {1, 0.45f, 0.20f}, {1, 0.30f, 0}, {1, 0.45f, 0.25f}, {1, 0.30f, 0}, {1, 0.35f, 0.15f}};
+static const float T_T60[NTIMBRES][3]   = {
+  {1.1f, 0.22f, 0.06f}, {1.8f, 0.25f, 0}, {1.5f, 0.5f, 0.2f}, {2.6f, 0.6f, 0}, {3.5f, 2.0f, 1.2f}, {3.2f, 0.9f, 0},
+  {1.2f, 0.4f, 0}, {2.4f, 1.1f, 0.5f}, {3.0f, 1.4f, 0}, {0.4f, 0.25f, 0.15f}, {0.15f, 0.06f, 0}, {0.7f, 0.35f, 0.2f}};
 
 // a short memory keeps identical notes from stacking and caps how many start at once
 static const int NRECENT = 16;
@@ -371,15 +396,16 @@ static void handleKeys() {
   auto ks = M5Cardputer.Keyboard.keysState();
   for (char c : ks.word) {
     if (c >= '1' && c <= '6') layerOn[c - '1'] = !layerOn[c - '1'];
-    else if (c == 'q') goToSleep();
+    else if (c == 'a') setChannel((channel + 11) % 13 + 1);
+    else if (c == 'd') setChannel(channel % 13 + 1);
+    else if (c == 's') hopping = !hopping;
+    else if (c == 'f') divIdx = min(divIdx + 1, 5);
+    else if (c == 'g') divIdx = max(divIdx - 1, 0);
+    else if (c == 'z') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
+    else if (c == 'x') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
     else if (c == 'm') muted = !muted;
-    else if (c == '/') setChannel(channel % 13 + 1);
-    else if (c == ',') setChannel((channel + 11) % 13 + 1);
-    else if (c == 'h') hopping = !hopping;
-    else if (c == '[') divIdx = min(divIdx + 1, 5);
-    else if (c == ']') divIdx = max(divIdx - 1, 0);
-    else if (c == '=') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
-    else if (c == '-') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
+    else if (c == 'k') kit = (kit + 1) % 4;
+    else if (c == 'o') goToSleep();
   }
 }
 
@@ -416,13 +442,13 @@ static int drawTag(int x, int y, int L, const char* count, uint32_t now) {
 static void draw() {
   canvas.fillSprite(TFT_BLACK);
   uint32_t now = millis();
-  const int ROWS = 6, ROW_H = 16, BAR_X = 150, BAR_W = 76;
+  const int ROWS = 5, ROW_H = 16, BAR_X = 150, BAR_W = 76;
 
   // rows: up to three of each family, so neither can crowd the other out
   int pick[ROWS], np = 0;
   bool taken[NV] = {false};
   for (int fam = 0; fam < 2; fam++)
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 3 && np < ROWS; r++) {
       int b = strongest(now, fam == 1, taken);
       if (b < 0) break;
       taken[b] = true; pick[np++] = b;
@@ -464,15 +490,18 @@ static void draw() {
   snprintf(c[4], 12, "%u", (unsigned)deauthCount);
   snprintf(c[5], 12, "%d", presentKind[2]);
   int x = 4;
-  for (int L = 0; L < 3; L++) x = drawTag(x, 102, L, c[L], now);
+  for (int L = 0; L < 3; L++) x = drawTag(x, 86, L, c[L], now);
   x = 4;
-  for (int L = 3; L < 6; L++) x = drawTag(x, 113, L, c[L], now);
+  for (int L = 3; L < 6; L++) x = drawTag(x, 97, L, c[L], now);
 
   canvas.setTextColor(TFT_WHITE);
-  char l3[48];
-  snprintf(l3, sizeof(l3), ",/ ch%d %d  h %s  [] /%d  -= %d %s q",
-           channel, 2407 + 5 * channel, hopping ? "HOP" : "hop", DIVS[divIdx], volume, muted ? "M" : "m");
-  canvas.drawString(l3, 4, 125);
+  char l3[48], l4[48];
+  snprintf(l3, sizeof(l3), "a d ch%d %dMHz  s %s  k %s",
+           channel, 2407 + 5 * channel, hopping ? "SCAN" : "scan", KIT_NAMES[kit]);
+  snprintf(l4, sizeof(l4), "f g /%d  z x vol%d  m %s  o off",
+           DIVS[divIdx], volume, muted ? "MUTED" : "mute");
+  canvas.drawString(l3, 4, 112);
+  canvas.drawString(l4, 4, 123);
   canvas.pushSprite(0, 0);
 }
 
@@ -521,13 +550,13 @@ void loop() {
     bool sounded = false;
     if (e.kind == 0) {
       if (++v.n % DIVS[divIdx]) continue;                    // each AP on its own real clock, thinned
-      sounded = play(pitchFor(v), amp * lvl(L_BEACON), T_MARIMBA, len, bright);
+      sounded = play(pitchFor(v), amp * lvl(L_BEACON), KIT[kit][L_BEACON], len, bright);
     } else if (e.kind == 1) {
       if (now - v.lastSound < 400) continue;
-      sounded = play(pitchFor(v), amp * 0.7f * lvl(L_PROBE), T_KALIMBA, len, bright);
+      sounded = play(pitchFor(v), amp * 0.7f * lvl(L_PROBE), KIT[kit][L_PROBE], len, bright);
     } else {
       if (now - v.lastSound < 60u * DIVS[divIdx]) continue;
-      sounded = play(pitchFor(v), amp * lvl(L_BLE), T_TONGUE, len, bright);
+      sounded = play(pitchFor(v), amp * lvl(L_BLE), KIT[kit][L_BLE], len, bright);
     }
     v.lastSound = now;
     if (sounded) { v.flash = now; layerFlash[L] = now; }
@@ -542,7 +571,7 @@ void loop() {
       float r = dataRssi, nr = nearness(r);
       float f = fold(fundamental() * harmonic(r, 3, 16), 110, 2000);
       float len = 0.4f + 2.0f * constrain(dataLen / 1500.0f, 0.0f, 1.0f);
-      if (play(f, (0.03f + 0.14f * nr) * lvl(L_TRAFFIC), T_VIBES, len, 0.3f + 1.2f * nr)) layerFlash[L_TRAFFIC] = now;
+      if (play(f, (0.03f + 0.14f * nr) * lvl(L_TRAFFIC), KIT[kit][L_TRAFFIC], len, 0.3f + 1.2f * nr)) layerFlash[L_TRAFFIC] = now;
       lastTraffic = now;
     }
   }
@@ -554,7 +583,7 @@ void loop() {
     if (layerOn[L_DEAUTH] && now - lastBell > 2500) {
       float r = deauthRssi, nr = nearness(r);
       float f = fold(fundamental() * 2.0f * harmonic(r, 2, 8), 110, 1400);
-      if (play(f, (0.05f + 0.1f * nr) * lvl(L_DEAUTH), T_BELL, 1.0f, 0.5f + nr)) layerFlash[L_DEAUTH] = now;
+      if (play(f, (0.05f + 0.1f * nr) * lvl(L_DEAUTH), KIT[kit][L_DEAUTH], 1.0f, 0.5f + nr)) layerFlash[L_DEAUTH] = now;
       lastBell = now;
     }
   }
@@ -587,7 +616,11 @@ void loop() {
   }
 
   static uint32_t lastHop = 0;
-  if (hopping && now - lastHop > 1500) { setChannel(channel % 13 + 1); lastHop = now; }
+  if (hopping && now - lastHop > 1500) {                  // back and forth, so the sweep never jumps
+    if (channel + hopDir > 13 || channel + hopDir < 1) hopDir = -hopDir;
+    setChannel(channel + hopDir);
+    lastHop = now;
+  }
 
   static uint32_t lastDraw = 0;
   if (now - lastDraw > 60) { draw(); lastDraw = now; }

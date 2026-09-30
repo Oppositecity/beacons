@@ -1,0 +1,47 @@
+# Builds beacons.bin for the M5Stack Cardputer (original + ADV) on every push
+# and publishes it as a release. Newest build is always at:
+#   https://github.com/Oppositecity/beacons/releases/latest/download/beacons.bin
+# Download it, drag it into Launcher's WebUI, press the rocket.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install core and libraries (pinned to the known-good build)
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.9
+          arduino-cli lib update-index
+          arduino-cli lib install "M5Cardputer@1.1.1" "M5Unified@0.2.24" "M5GFX@0.2.31"
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            -b esp32:esp32:stamp-s3:CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB \
+            --export-binaries beacons
+          mkdir -p out
+          cp beacons/build/*/beacons.ino.bin out/beacons.bin
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build ${{ github.run_number }}
+          files: out/beacons.bin
+          make_latest: true

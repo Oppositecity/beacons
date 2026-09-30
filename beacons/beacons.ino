@@ -63,6 +63,16 @@ static const int DIVS[] = {1, 2, 5, 10, 20, 50};
 //  radio -> loop event queue
 // =====================================================================
 struct Ev { uint8_t kind; uint8_t mac[6]; int8_t rssi; char name[33]; };   // kind 0 AP, 1 probe, 2 BLE
+// every type used in a function signature is defined up here, before the first function,
+// so the Arduino builder's auto-generated prototypes always compile
+enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_DROP };
+struct Partial { float a1, a2, y1, y2, env, rblk; };
+struct Note { Partial p[3]; int np; bool active; };
+struct NoteEv { float f, amp, len; uint8_t timbre; };
+struct Voice {
+  uint8_t mac[6]; char s[33]; uint8_t kind; int rssi;
+  uint32_t seen, flash, lastSound, n; bool used;
+};
 static const int QN = 64;
 static Ev q[QN];
 static volatile int qHead = 0, qTail = 0;
@@ -161,19 +171,15 @@ static float pitchFor(const uint8_t* mac, int kind) {
 //  synthesis engine — modal resonators in their own task
 // =====================================================================
 static const int SR = 22050, BLK = 256;
-enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_DROP };
-struct Partial { float a1, a2, y1, y2, env, rblk; };
-struct Note { Partial p[3]; int np; bool active; };
 static const int NNOTES = 24;
 static Note notes[NNOTES];
 
-struct NoteEv { float f, amp, len; uint8_t timbre; };
 static const int NQ = 32;
 static NoteEv nq[NQ];
 static volatile int nqHead = 0, nqTail = 0;
 static portMUX_TYPE nmux = portMUX_INITIALIZER_UNLOCKED;
 
-static void play(float f, float amp, uint8_t timbre, float len = 1.0f) {
+static void play(float f, float amp, uint8_t timbre, float len) {
   if (muted || amp <= 0) return;
   portENTER_CRITICAL(&nmux);
   int next = (nqHead + 1) % NQ;
@@ -305,10 +311,6 @@ static void synthTask(void*) {
 // =====================================================================
 //  voices on screen: one per device heard
 // =====================================================================
-struct Voice {
-  uint8_t mac[6]; char s[33]; uint8_t kind; int rssi;
-  uint32_t seen, flash, lastSound, n; bool used;
-};
 static const int NV = 32;
 static Voice voices[NV];
 
@@ -549,7 +551,7 @@ void loop() {
     while (dropsPerTick > 0) {
       if ((esp_random() % 1000) < dropsPerTick * 1000) {
         float df = fold(scaleNote(esp_random(), 3), 900, 2600);
-        play(df, (0.02f + 0.03f * (esp_random() % 100) / 100.0f) * lvl(L_RAIN) * 1.6f, T_DROP);
+        play(df, (0.02f + 0.03f * (esp_random() % 100) / 100.0f) * lvl(L_RAIN) * 1.6f, T_DROP, 1.0f);
         layerFlash[L_RAIN] = now;
       }
       dropsPerTick -= 1.0f;

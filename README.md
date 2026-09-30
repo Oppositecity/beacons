@@ -1,8 +1,8 @@
 # BEACONS
 
-The air around you as a small band. An M5Stack Cardputer (original or ADV) piece that listens to WiFi and Bluetooth and turns what it hears into warm, struck, harmonic music.
+Listening to the air. An M5Stack Cardputer (original or ADV) piece that listens to WiFi and Bluetooth and turns what it hears into struck, ringing sound.
 
-Everything plays in one key, on one tempo grid, over a slowly turning chord progression. Every device gets a fixed role in the chord, and every access point keeps its own slightly drifting clock, so the clocks phase against each other as rhythm.
+Nothing is composed. Every sound is a measurement: notes sound the moment a signal arrives, pitch is how close its source is, and the whole field shifts as you walk through a room.
 
 Nothing is stored, logged, or transmitted. It only listens.
 
@@ -12,23 +12,33 @@ The newest build is always here: [beacons.bin](https://github.com/Oppositecity/b
 
 With [M5Launcher](https://github.com/bmorcelli/Launcher): open WebUI on the device, drag `beacons.bin` into Files, press the rocket to install.
 
+## What each part of the sound means
+
+| sound | measurement |
+|---|---|
+| when a note sounds | the moment a signal arrives |
+| pitch | how close the source is: each device climbs the harmonic series as you approach it, about one step per 4-5 dB |
+| the fundamental under it all | the WiFi channel you're hearing (ch1 = 55 Hz ... ch13 = 110 Hz) |
+| a slight sharp or flat bend | the source getting closer or farther, like a doppler shift |
+| loudness, brightness, ring length | signal strength |
+| timbre | the kind of signal |
+
 ## Layers
 
-| key | layer | what it hears | its part in the band |
+| key | layer | what it hears | timbre |
 |---|---|---|---|
-| `1` | beacons | WiFi access points announcing themselves | marimba, middle voices |
-| `2` | probes | phones calling for networks they remember | kalimba, high voices |
-| `3` | traffic | WiFi data volume on the current channel | vibraphone arpeggio; busier air, busier arpeggio |
-| `4` | floor | the radio noise floor | drone on the chord root, gliding with each change |
-| `5` | deauth | disconnect frames (rare; often an attack) | a struck bell chord |
-| `6` | bluetooth | BLE devices advertising nearby | tongue drum bass, roots and fifths |
-| `7` | motion | shaking the Cardputer (ADV motion sensor) | a strummed chord |
+| `1` | beacons | WiFi access points announcing themselves, each on its own clock | marimba |
+| `2` | probes | phones calling for networks they remember | kalimba, an octave up |
+| `3` | traffic | WiFi data frames; every Nth frame sounds, ringing longer for bigger frames | vibraphone |
+| `4` | floor | the radio noise floor, and how many devices are present | drone: loudness = noise floor, one harmonic per device present |
+| `5` | deauth | disconnect frames (rare; often an attack) | a struck bell |
+| `6` | bluetooth | BLE devices advertising nearby | tongue drum, low register |
 
-All synthesis is modal (struck-bar physics with natural decays). Pitches stay between 130 and 2000 Hz, the output runs through a soft limiter, and volume is capped.
+Pitches stay between 110 and 2000 Hz, the output runs through a soft limiter, and volume is capped.
 
 ## Keys
 
-Both screens: `1`-`7` layer on/off, `tab` switch between play and mixer, `m` mute, `q` sleep (reset to wake).
+Both screens: `1`-`6` layer on/off, `tab` switch between play and mixer, `m` mute, `q` sleep (reset to wake).
 
 Play screen:
 
@@ -36,14 +46,12 @@ Play screen:
 |---|---|
 | `,` `/` | WiFi channel down / up |
 | `h` | hop through all channels |
-| `;` `.` | octave up / down |
-| `t` | tempo: 60, 72, 84, 96, 108 |
-| `s` | mood: major, dorian, lydian, minor progressions |
-| `l` | note length |
-| `[` `]` | thin / thicken how often each device plays |
+| `[` `]` | thin / thicken how often each source sounds |
 | `-` `=` | volume |
 
 Mixer screen: `;` `.` select a layer, `-` `=` set its level.
+
+On the play screen, the six nearest sources are listed with the closest (highest) at the top; the bar is signal strength and `+` / `-` means approaching / receding.
 
 ## Build
 

@@ -1,28 +1,34 @@
-// BEACONS v0.8 — the air around you as a small band, for M5Stack Cardputer (original + ADV)
+// BEACONS v0.9 — listening to the air, for M5Stack Cardputer (original + ADV)
 //
-// Everything plays in one key over a slowly turning chord progression, and every note sounds
-// the moment its signal arrives. Each signal the radio hears takes a musical role:
-//   1 beacons    WiFi access points announcing themselves   -> marimba, middle voices
-//   2 probes     phones calling for networks they remember  -> kalimba, high voices
-//   3 traffic    WiFi data frames on this channel           -> vibraphone arpeggio, a note every Nth frame
-//   4 floor      the radio noise floor                      -> drone on the chord root, gliding with each change
-//   5 deauth     disconnect frames (rare; often an attack)  -> a struck bell chord
-//   6 bluetooth  BLE devices advertising nearby             -> tongue drum bass, roots and fifths
-//   7 motion     shaking the Cardputer (ADV motion sensor)  -> a strummed chord
-// Access points keep their own drifting clocks, so their pulses phase against each other.
-// Tempo sets how fast the chords change.
+// Nothing here is composed. Every sound is a measurement:
+//   when a note sounds  = the moment a signal arrives
+//   its pitch           = how close the source is: each device climbs the harmonic series as you
+//                         approach it (about one step per 4-5 dB), over a fundamental set by the
+//                         WiFi channel you're hearing (ch1 = 55 Hz ... ch13 = 110 Hz)
+//   its bend            = whether it's getting closer or farther: approaching sources go slightly
+//                         sharp, receding ones flat, like a doppler shift
+//   loudness, brightness, ring length = signal strength (close = loud, bright, long)
+//   timbre              = what kind of signal it is
 //
-// Synthesis is modal (struck-bar physics, natural decays, soft onsets). Pitches stay within
-// 130–2000 Hz, the output passes a soft limiter, and volume is capped.
+//   1 beacons    WiFi access points announcing themselves      -> marimba, on each AP's own clock
+//   2 probes     phones calling for networks they remember     -> kalimba, an octave up
+//   3 traffic    WiFi data frames; every Nth frame sounds       -> vibraphone; pitch from that frame's
+//                                                                  strength, ring length from its size
+//   4 floor      the radio noise floor + how many devices      -> drone: loudness = noise floor,
+//                are present                                      one harmonic per device present (max 8)
+//   5 deauth     disconnect frames (rare; often an attack)     -> a struck bell
+//   6 bluetooth  BLE devices advertising nearby                -> tongue drum, low register
+//
+// Pitches stay within 110–2000 Hz, the output passes a soft limiter, and volume is capped.
 //
 // Two screens, switched with tab:
-//   play   up to six voices as rows, highest pitch at top; a row flashes when it sounds,
-//          the bar is signal strength. ? = probe, * = bluetooth.
-//   mixer  the seven layers; UPPERCASE = on, the bar is level, a row flashes when that layer sounds.
+//   play   up to six sources as rows, highest pitch (closest) at top; a row flashes when it sounds,
+//          the bar is signal strength, + / - at the end = approaching / receding.
+//          ? = probe, * = bluetooth.
+//   mixer  the six layers; UPPERCASE = on, the bar is level, a row flashes when that layer sounds.
 //
-// keys (both screens):  1-7 layer on/off   tab switch screen   m mute   q sleep (reset to wake)
-// play screen:          , / channel   h hop   ; . octave   t chord tempo   s mood (chord progression)
-//                       l note length   [ ] thin/thicken   - = volume
+// keys (both screens):  1-6 layer on/off   tab switch screen   m mute   q sleep (reset to wake)
+// play screen:          , / channel   h hop channels   [ ] thin/thicken   - = volume
 // mixer screen:         ; . select layer   - = layer level
 //
 // Nothing is stored or transmitted. Listening only.
@@ -38,52 +44,35 @@
 //  types — all defined before the first function, so the Arduino
 //  builder's auto-generated prototypes always compile
 // =====================================================================
-enum { L_BEACON, L_PROBE, L_TRAFFIC, L_FLOOR, L_DEAUTH, L_BLE, L_MOTION, NLAYERS };
+enum { L_BEACON, L_PROBE, L_TRAFFIC, L_FLOOR, L_DEAUTH, L_BLE, NLAYERS };
 enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_VIBES, T_BELL, NTIMBRES };
 struct Ev { uint8_t kind; uint8_t mac[6]; int8_t rssi; char name[33]; };   // kind 0 AP, 1 probe, 2 BLE
 struct Partial { float a1, a2, y1, y2, env, rblk; };
 struct Note { Partial p[3]; int np; bool active; };
-struct NoteEv { float f, amp, len; uint8_t timbre; };
+struct NoteEv { float f, amp, len, bright; uint8_t timbre; };
 struct Voice {
-  uint8_t mac[6]; char s[33]; uint8_t kind; int rssi;
+  uint8_t mac[6]; char s[33]; uint8_t kind; float rssi, rssiSlow;
   uint32_t seen, flash, lastSound, n; bool used;
 };
-struct Sched { uint32_t at; float f, amp, len; uint8_t timbre, layer; int16_t voice; bool used; };
 
 // =====================================================================
 //  layers and controls
 // =====================================================================
-static const char* LAYER_NAMES[NLAYERS] = {"beacons", "probes", "traffic", "floor", "deauth", "bluetooth", "motion"};
-static bool     layerOn[NLAYERS]    = {true, true, true, true, true, true, true};
-static int      layerLvl[NLAYERS]   = {7, 5, 5, 4, 6, 6, 6};     // 0..10
+static const char* LAYER_NAMES[NLAYERS] = {"beacons", "probes", "traffic", "floor", "deauth", "bluetooth"};
+static bool     layerOn[NLAYERS]    = {true, true, true, true, true, true};
+static int      layerLvl[NLAYERS]   = {7, 5, 5, 4, 6, 6};     // 0..10
 static uint32_t layerFlash[NLAYERS] = {0};
-static bool     imuOk = false;
 
 static int  channel  = 6;
 static bool muted    = false;
 static bool hopping  = false;
-static int  octave   = 0;
-static int  moodIdx  = 0;
-static int  tempoIdx = 2;
-static int  lenIdx   = 1;
 static int  volume   = 120;
 static const int VOL_MAX = 200;                // hard cap for ears and equipment
 static int  divIdx   = 3;
 static bool mixerView = false;
 static int  sel      = 0;
-static const float LENS[] = {0.5f, 1.0f, 2.0f, 4.0f};
 static const int DIVS[] = {1, 2, 5, 10, 20, 50};
-static const int TEMPOS[] = {60, 72, 84, 96, 108};
-
-// four moods, each a four-chord progression; chords are semitones above the key root
-static const char* MOOD_NAMES[] = {"major", "dorian", "lydian", "minor"};
-static const int CHORDS[4][4][4] = {
-  {{0, 4, 7, 14}, {9, 12, 16, 19}, {5, 9, 12, 16}, {7, 12, 14, 19}},   // I add9, vi7, IV maj7, V sus
-  {{0, 3, 7, 14}, {5, 9, 12, 15}, {0, 3, 7, 10}, {10, 14, 17, 22}},    // i9, IV7, i7, bVII
-  {{0, 4, 7, 11}, {2, 6, 9, 13}, {0, 4, 7, 14}, {2, 6, 9, 16}},        // I maj7, II, I add9, II add9
-  {{0, 3, 7, 10}, {8, 12, 15, 19}, {3, 7, 10, 14}, {10, 14, 17, 21}},  // i7, VI maj7, III maj7, bVII
-};
-static int chordIdx = 0;
+static int  present  = 0;                      // devices heard in the last 5 s
 
 // =====================================================================
 //  radio -> loop event queue
@@ -93,7 +82,7 @@ static Ev q[QN];
 static volatile int qHead = 0, qTail = 0;
 static portMUX_TYPE qmux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t dataCount = 0, deauthCount = 0;
-static volatile int noiseFloor = -95;
+static volatile int noiseFloor = -95, dataRssi = -80, dataLen = 200, deauthRssi = -80;
 
 static void pushEv(const Ev& e) {
   portENTER_CRITICAL(&qmux);
@@ -113,13 +102,13 @@ static bool popEv(Ev& e) {
 static void onPkt(void* buf, wifi_promiscuous_pkt_type_t type) {
   auto* p = (wifi_promiscuous_pkt_t*)buf;
   noiseFloor = p->rx_ctrl.noise_floor;
-  if (type == WIFI_PKT_DATA) { dataCount++; return; }
+  int len = p->rx_ctrl.sig_len;
+  if (type == WIFI_PKT_DATA) { dataRssi = p->rx_ctrl.rssi; dataLen = len; dataCount++; return; }
   if (type != WIFI_PKT_MGMT) return;
   const uint8_t* f = p->payload;
-  int len = p->rx_ctrl.sig_len;
   if (len < 24) return;
   uint8_t sub = (f[0] >> 4) & 0x0F;
-  if (sub == 12 || sub == 10) { deauthCount++; return; }   // deauth / disassoc
+  if (sub == 12 || sub == 10) { deauthRssi = p->rx_ctrl.rssi; deauthCount++; return; }   // deauth / disassoc
   uint8_t kind; int tag;
   if (sub == 8)      { kind = 0; tag = 36; }   // beacon
   else if (sub == 4) { kind = 1; tag = 24; }   // probe request
@@ -153,28 +142,25 @@ static volatile bool bleScanning = false;
 static void bleDone(BLEScanResults) { bleScanning = false; }
 
 // =====================================================================
-//  harmony
+//  mapping: measurement -> sound
 // =====================================================================
-static uint32_t hashMac(const uint8_t* m) {
-  uint32_t h = 2166136261u;
-  for (int i = 0; i < 6; i++) { h ^= m[i]; h *= 16777619u; }
-  return h;
-}
 static float fold(float f, float lo, float hi) {
   while (f < lo) f *= 2.0f;
   while (f > hi) f *= 0.5f;
   return f;
 }
-static float keyRoot() { return 130.81f * powf(2.0f, octave); }           // C3, shifted by octave
-static float semi(int s) { return keyRoot() * powf(2.0f, s / 12.0f); }
-static int chordTone(int i) { return CHORDS[moodIdx][chordIdx][i & 3]; }
+static float fundamental() { return 55.0f * powf(2.0f, (channel - 1) / 12.0f); }   // one semitone per channel
+static float nearness(float rssi) { return constrain((rssi + 95.0f) / 65.0f, 0.0f, 1.0f); }   // -95 dBm far .. -30 close
+static int harmonic(float rssi, int lo, int hi) { return lo + (int)roundf(nearness(rssi) * (hi - lo)); }
 
-// every device has a fixed role in the chord: the chord changes, the role stays
-static float pitchFor(const uint8_t* mac, int kind) {
-  uint32_t h = hashMac(mac);
-  if (kind == 2) return fold(semi(chordTone((h % 2) * 2)), 130, 330);                  // bass: root or fifth
-  if (kind == 1) return fold(semi(chordTone(h % 4) + 24 + 12 * ((h >> 8) % 2)), 520, 2000);  // high
-  return fold(semi(chordTone(h % 4) + 12 + 12 * ((h >> 8) % 2)), 196, 1100);           // middle
+// pitch of a device: harmonic number from its strength, bent by its approach or retreat
+static float pitchFor(const Voice& v) {
+  float f0 = fundamental(), f;
+  if (v.kind == 2)      f = 2.0f * f0 * harmonic(v.rssi, 1, 5);      // bluetooth: low
+  else if (v.kind == 1) f = 2.0f * f0 * harmonic(v.rssi, 4, 12);     // probes: an octave up
+  else                  f = f0 * harmonic(v.rssi, 2, 16);            // access points: middle
+  float cents = constrain((v.rssi - v.rssiSlow) * 8.0f, -40.0f, 40.0f);
+  return fold(f * powf(2.0f, cents / 1200.0f), 110, 2000);
 }
 
 // =====================================================================
@@ -188,18 +174,34 @@ static NoteEv nq[NQ];
 static volatile int nqHead = 0, nqTail = 0;
 static portMUX_TYPE nmux = portMUX_INITIALIZER_UNLOCKED;
 
-static void play(float f, float amp, uint8_t timbre, float len) {
-  if (muted || amp <= 0) return;
-  portENTER_CRITICAL(&nmux);
-  int next = (nqHead + 1) % NQ;
-  if (next != nqTail) { nq[nqHead] = {f, amp, len, timbre}; nqHead = next; }
-  portEXIT_CRITICAL(&nmux);
-}
-
 // partial ratios, relative amplitudes, decay times (seconds to fade 60 dB)
 static const float T_RATIO[NTIMBRES][3] = {{1, 3.99f, 9.9f}, {1, 5.9f, 0}, {1, 2.0f, 3.01f}, {1, 4.0f, 0}, {1, 2.0f, 3.0f}};
 static const float T_AMP[NTIMBRES][3]   = {{1, 0.28f, 0.07f}, {1, 0.16f, 0}, {1, 0.33f, 0.09f}, {1, 0.12f, 0}, {1, 0.45f, 0.22f}};
 static const float T_T60[NTIMBRES][3]   = {{1.1f, 0.22f, 0.06f}, {1.8f, 0.25f, 0}, {1.5f, 0.5f, 0.2f}, {2.6f, 0.6f, 0}, {3.5f, 2.0f, 1.2f}};
+
+// a short memory keeps identical notes from stacking and caps how many start at once
+static const int NRECENT = 16;
+static float recentF[NRECENT];
+static uint32_t recentT[NRECENT];
+static int recentI = 0;
+
+static bool play(float f, float amp, uint8_t timbre, float len, float bright) {
+  if (muted || amp <= 0) return false;
+  uint32_t now = millis();
+  int crowd = 0;
+  for (int i = 0; i < NRECENT; i++) {
+    if (now - recentT[i] > 60) continue;
+    if (fabsf(recentF[i] - f) < 1.0f) return false;
+    crowd++;
+  }
+  if (crowd >= 6) return false;
+  recentF[recentI] = f; recentT[recentI] = now; recentI = (recentI + 1) % NRECENT;
+  portENTER_CRITICAL(&nmux);
+  int next = (nqHead + 1) % NQ;
+  if (next != nqTail) { nq[nqHead] = {f, amp, len, bright, timbre}; nqHead = next; }
+  portEXIT_CRITICAL(&nmux);
+  return true;
+}
 
 static void startNote(const NoteEv& e) {
   int slot = -1; float quietest = 1e9;
@@ -218,7 +220,7 @@ static void startNote(const NoteEv& e) {
     float t60 = T_T60[e.timbre][k] * e.len;
     float rr = powf(0.001f, 1.0f / (t60 * SR));
     float w = 2.0f * PI * fk / SR;
-    float A = e.amp * T_AMP[e.timbre][k];
+    float A = e.amp * T_AMP[e.timbre][k] * (k ? e.bright : 1.0f);
     Partial& p = n.p[n.np++];
     p.a1 = 2.0f * rr * cosf(w); p.a2 = -rr * rr;
     p.y1 = A * sinf(w); p.y2 = 0;                     // starts at zero crossing: no click
@@ -227,8 +229,9 @@ static void startNote(const NoteEv& e) {
   n.active = n.np > 0;
 }
 
-// drone (floor layer): root + fifth + octave, gliding to each new chord root
-static volatile float droneTarget = 0, droneRoot = 130.81f;
+// drone (floor layer): harmonics of the channel's fundamental, one per device present
+static volatile float droneLevel = 0, droneF0 = 73.4f;
+static volatile int dronePartials = 1;
 
 static float softclip(float x) {
   if (x > 3) x = 3; else if (x < -3) x = -3;
@@ -240,7 +243,7 @@ static float mix[BLK];
 
 static void synthTask(void*) {
   int ob = 0;
-  float d1 = 0, d2 = 0, d3 = 0, lfo = 0, droneGain = 0, rootS = 130.81f;
+  float ph[8] = {0}, g[8] = {0}, f0s = 73.4f, lfo = 0;
   for (;;) {
     if (M5Cardputer.Speaker.isPlaying(0) >= 2) { vTaskDelay(1); continue; }
 
@@ -270,19 +273,22 @@ static void synthTask(void*) {
       n.active = alive;
     }
 
-    float dt = droneTarget, rt = droneRoot;
+    // drone: partial k+1 fades in when at least k+1 devices are present
+    float lv = droneLevel, ft = droneF0; int nk = dronePartials;
+    float tg[8];
+    for (int k = 0; k < 8; k++) tg[k] = (k < nk) ? lv / (1.0f + 0.6f * k) : 0.0f;
     for (int s = 0; s < BLK; s++) {
-      droneGain += (dt - droneGain) * 0.0004f;
-      rootS += (rt - rootS) * 0.00015f;                // portamento between chord roots
-      if (droneGain > 1e-5f) {
-        lfo += 2 * PI * 0.07f / SR; if (lfo > 2 * PI) lfo -= 2 * PI;
-        float breath = 0.7f + 0.3f * sinf(lfo);
-        mix[s] += droneGain * breath * (sinf(d1) + 0.55f * sinf(d2) + 0.22f * sinf(d3));
+      f0s += (ft - f0s) * 0.0002f;
+      lfo += 2 * PI * 0.07f / SR; if (lfo > 2 * PI) lfo -= 2 * PI;
+      float breath = 0.75f + 0.25f * sinf(lfo), acc = 0;
+      for (int k = 0; k < 8; k++) {
+        g[k] += (tg[k] - g[k]) * 0.0002f;
+        float fk = f0s * 2.0f * (k + 1);                // start an octave above the fundamental
+        if (fk > 2000) continue;
+        ph[k] += 2 * PI * fk / SR; if (ph[k] > 2 * PI) ph[k] -= 2 * PI;
+        if (g[k] > 1e-5f) acc += g[k] * sinf(ph[k]);
       }
-      d1 += 2 * PI * rootS / SR;
-      d2 += 2 * PI * (rootS * 1.5f + 0.35f) / SR;
-      d3 += 2 * PI * (rootS * 2.0f - 0.2f) / SR;
-      if (d1 > 2 * PI) d1 -= 2 * PI; if (d2 > 2 * PI) d2 -= 2 * PI; if (d3 > 2 * PI) d3 -= 2 * PI;
+      mix[s] += breath * acc;
     }
 
     int16_t* o = outbuf[ob];
@@ -293,32 +299,7 @@ static void synthTask(void*) {
 }
 
 // =====================================================================
-//  notes sound the moment their signal arrives; a short memory keeps
-//  identical notes from stacking and caps how many start at once
-// =====================================================================
-static const int NS = 48;
-static Sched sched[NS];
-static const int NRECENT = 16;
-static float recentF[NRECENT];
-static uint32_t recentT[NRECENT];
-static int recentI = 0;
-
-static void schedule(uint32_t at, float f, float amp, uint8_t timbre, float len, uint8_t layer, int16_t voice) {
-  if (amp <= 0 || muted) return;
-  int crowd = 0;
-  for (int i = 0; i < NRECENT; i++) {
-    if (at - recentT[i] > 60 || recentT[i] > at) continue;
-    if (fabsf(recentF[i] - f) < 1.0f) return;         // the same pitch twice within 60 ms: once is enough
-    crowd++;
-  }
-  if (crowd >= 5) return;                             // at most five notes starting together, so it never smears
-  recentF[recentI] = f; recentT[recentI] = at; recentI = (recentI + 1) % NRECENT;
-  for (int i = 0; i < NS; i++)
-    if (!sched[i].used) { sched[i] = {at, f, amp, len, timbre, layer, voice, true}; return; }
-}
-
-// =====================================================================
-//  voices on screen: one per device heard
+//  sources on screen: one per device heard
 // =====================================================================
 static const int NV = 32;
 static Voice voices[NV];
@@ -344,7 +325,7 @@ static int hear(const Ev& e) {
   if (slot < 0) slot = oldest;
   Voice& v = voices[slot];
   if (!v.used || v.kind != e.kind || memcmp(v.mac, e.mac, 6) != 0) {
-    memcpy(v.mac, e.mac, 6); v.kind = e.kind; v.rssi = e.rssi;
+    memcpy(v.mac, e.mac, 6); v.kind = e.kind; v.rssi = v.rssiSlow = e.rssi;
     v.n = esp_random() % 50; v.flash = 0; v.lastSound = 0; v.used = true; v.s[0] = 0;
   }
   char s[33]; strcpy(s, e.name);
@@ -353,7 +334,8 @@ static int hear(const Ev& e) {
     if (e.kind == 1) strcpy(v.s, "any");
     else snprintf(v.s, sizeof(v.s), "%s %02x%02x", e.kind == 2 ? "ble" : "hidden", e.mac[4], e.mac[5]);
   }
-  v.rssi = (v.rssi * 3 + e.rssi) / 4;
+  v.rssi = v.rssi * 0.6f + e.rssi * 0.4f;              // quick: follows you as you move
+  v.rssiSlow = v.rssiSlow * 0.95f + e.rssi * 0.05f;    // slow: what it was a few seconds ago
   v.seen = millis();
   return slot;
 }
@@ -385,7 +367,7 @@ static void handleKeys() {
   auto ks = M5Cardputer.Keyboard.keysState();
   if (ks.tab) mixerView = !mixerView;
   for (char c : ks.word) {
-    if (c >= '1' && c <= '7') { int L = c - '1'; if (L != L_MOTION || imuOk) layerOn[L] = !layerOn[L]; continue; }
+    if (c >= '1' && c <= '6') { layerOn[c - '1'] = !layerOn[c - '1']; continue; }
     if (c == 'q') goToSleep();
     else if (c == 'm') muted = !muted;
     else if (mixerView) {
@@ -399,11 +381,6 @@ static void handleKeys() {
       else if (c == 'h') hopping = !hopping;
       else if (c == '[') divIdx = min(divIdx + 1, 5);
       else if (c == ']') divIdx = max(divIdx - 1, 0);
-      else if (c == ';') octave = min(octave + 1, 1);
-      else if (c == '.') octave = max(octave - 1, -1);
-      else if (c == 's') moodIdx = (moodIdx + 1) % 4;
-      else if (c == 't') tempoIdx = (tempoIdx + 1) % 5;
-      else if (c == 'l') lenIdx = (lenIdx + 1) % 4;
       else if (c == '=') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
       else if (c == '-') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
     }
@@ -414,7 +391,7 @@ static void handleKeys() {
 //  screens
 // =====================================================================
 static void drawPlay(uint32_t now) {
-  const int ROWS = 6, ROW_H = 17, BAR_X = 150, BAR_W = 86;
+  const int ROWS = 6, ROW_H = 17, BAR_X = 150, BAR_W = 76;
   int pick[ROWS], np = 0;
   bool taken[NV] = {false};
   for (int r = 0; r < ROWS; r++) {
@@ -431,9 +408,7 @@ static void drawPlay(uint32_t now) {
   }
   for (int a = 0; a < np; a++)
     for (int b = a + 1; b < np; b++)
-      if (pitchFor(voices[pick[b]].mac, voices[pick[b]].kind) > pitchFor(voices[pick[a]].mac, voices[pick[a]].kind)) {
-        int t = pick[a]; pick[a] = pick[b]; pick[b] = t;
-      }
+      if (pitchFor(voices[pick[b]]) > pitchFor(voices[pick[a]])) { int t = pick[a]; pick[a] = pick[b]; pick[b] = t; }
 
   canvas.setFont(&fonts::FreeMono9pt7b);
   for (int r = 0; r < np; r++) {
@@ -446,23 +421,25 @@ static void drawPlay(uint32_t now) {
     char label[14];
     snprintf(label, sizeof(label), "%s%.12s", v.kind == 1 ? "?" : (v.kind == 2 ? "*" : ""), v.s);
     canvas.drawString(label, 4, y);
-    int w = map(constrain(v.rssi, -95, -30), -95, -30, 2, BAR_W);
+    int w = 2 + (int)(nearness(v.rssi) * BAR_W);
     canvas.fillRect(BAR_X, y + 5, w, 4, fg);
+    float trend = v.rssi - v.rssiSlow;
+    if (fabsf(trend) > 1.5f) canvas.drawString(trend > 0 ? "+" : "-", 229, y);
   }
 
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(TFT_WHITE);
   char l1[48], l2[48], l3[48];
-  snprintf(l1, sizeof(l1), ",/ ch%-2d  h %s  ;. oct%+d  t %d", channel, hopping ? "HOP" : "hop", octave, TEMPOS[tempoIdx]);
-  snprintf(l2, sizeof(l2), "s %-6s l x%g  [] /%d  -= vol%d", MOOD_NAMES[moodIdx], LENS[lenIdx], DIVS[divIdx], volume);
-  snprintf(l3, sizeof(l3), "tab mixer  1-7 layers  m %s  q sleep", muted ? "MUTED" : "mute");
+  snprintf(l1, sizeof(l1), ",/ ch%d %dMHz  h %s  f0 %dHz", channel, 2407 + 5 * channel, hopping ? "HOP" : "hop", (int)fundamental());
+  snprintf(l2, sizeof(l2), "[] /%d  -= vol%d  %d here  floor%d", DIVS[divIdx], volume, present, noiseFloor);
+  snprintf(l3, sizeof(l3), "tab mixer  1-6 layers  m %s  q sleep", muted ? "MUTED" : "mute");
   canvas.drawString(l1, 4, 104);
   canvas.drawString(l2, 4, 114);
   canvas.drawString(l3, 4, 124);
 }
 
 static void drawMixer(uint32_t now) {
-  const int ROW_H = 14, BAR_X = 150;
+  const int ROW_H = 16, BAR_X = 150;
   canvas.setFont(&fonts::FreeMono9pt7b);
   for (int L = 0; L < NLAYERS; L++) {
     int y = 2 + L * ROW_H;
@@ -474,16 +451,15 @@ static void drawMixer(uint32_t now) {
     strcpy(name, LAYER_NAMES[L]);
     if (layerOn[L]) for (char* c = name; *c; c++) *c = toupper(*c);
     char row[24];
-    if (L == L_MOTION && !imuOk) snprintf(row, sizeof(row), "%c%d n/a", sel == L ? '>' : ' ', L + 1);
-    else snprintf(row, sizeof(row), "%c%d %s", sel == L ? '>' : ' ', L + 1, name);
+    snprintf(row, sizeof(row), "%c%d %s", sel == L ? '>' : ' ', L + 1, name);
     canvas.drawString(row, 2, y);
-    canvas.fillRect(BAR_X, y + 4, layerLvl[L] * 8 + 2, 4, fg);
+    canvas.fillRect(BAR_X, y + 5, layerLvl[L] * 8 + 2, 4, fg);
   }
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(TFT_WHITE);
   char l2[48];
   snprintf(l2, sizeof(l2), "tab play  m %s  q sleep", muted ? "MUTED" : "mute");
-  canvas.drawString("1-7 on/off   ;. select   -= level", 4, 112);
+  canvas.drawString("1-6 on/off   ;. select   -= level", 4, 112);
   canvas.drawString(l2, 4, 124);
 }
 
@@ -502,8 +478,6 @@ void setup() {
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Speaker.setVolume(volume);
   canvas.createSprite(240, 135);
-  imuOk = M5.Imu.isEnabled();
-  if (!imuOk) layerOn[L_MOTION] = false;
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -528,11 +502,7 @@ void loop() {
   handleKeys();
   uint32_t now = millis();
 
-  uint32_t stepMs = 60000 / TEMPOS[tempoIdx] / 4;           // one 16th note; chords change every 32
-  uint32_t step = now / stepMs;
-  chordIdx = (step / 32) % 4;
-
-  // radio events -> notes, right now
+  // devices: every note sounds the moment its signal arrives
   Ev e;
   int budget = 32;
   while (budget-- && popEv(e)) {
@@ -540,85 +510,63 @@ void loop() {
     if (!layerOn[L]) continue;
     int vi = hear(e);
     Voice& v = voices[vi];
-    float near = (constrain((int)e.rssi, -90, -30) + 90) / 60.0f;   // 0 far .. 1 close
-    float f = pitchFor(v.mac, v.kind);
+    float nr = nearness(v.rssi);
+    float amp = 0.04f + 0.24f * nr, bright = 0.3f + 1.3f * nr, len = 0.5f + 1.5f * nr;
+    bool sounded = false;
     if (e.kind == 0) {
-      if (++v.n % DIVS[divIdx]) continue;                  // each AP on its own real clock, thinned
-      schedule(now, f, (0.05f + 0.22f * near) * lvl(L_BEACON), T_MARIMBA, LENS[lenIdx], L_BEACON, vi);
+      if (++v.n % DIVS[divIdx]) continue;                    // each AP on its own real clock, thinned
+      sounded = play(pitchFor(v), amp * lvl(L_BEACON), T_MARIMBA, len, bright);
     } else if (e.kind == 1) {
-      if (now - v.lastSound < 600) continue;
-      schedule(now, f, 0.12f * lvl(L_PROBE), T_KALIMBA, LENS[lenIdx], L_PROBE, vi);
+      if (now - v.lastSound < 400) continue;
+      sounded = play(pitchFor(v), amp * 0.7f * lvl(L_PROBE), T_KALIMBA, len, bright);
     } else {
-      if (now - v.lastSound < 120u * DIVS[divIdx]) continue;
-      schedule(now, f, (0.06f + 0.2f * near) * lvl(L_BLE), T_TONGUE, LENS[lenIdx], L_BLE, vi);
+      if (now - v.lastSound < 60u * DIVS[divIdx]) continue;
+      sounded = play(pitchFor(v), amp * lvl(L_BLE), T_TONGUE, len, bright);
     }
     v.lastSound = now;
+    if (sounded) { v.flash = now; layerFlash[L] = now; }
   }
 
-  // traffic: one arpeggio note every Nth data frame, the moment that frame arrives
-  static uint32_t lastData = 0, lastArp = 0, lastDeauth = 0, lastBell = 0, lastStrum = 0;
-  static float shake = 0;
-  static int arp = 0;
-  uint32_t dc = dataCount;
-  uint32_t framesPerNote = 8 * DIVS[divIdx];
+  // traffic: every Nth data frame sounds, pitched by that frame's strength, ringing by its size
+  static uint32_t lastData = 0, lastTraffic = 0, lastDeauth = 0, lastBell = 0;
+  uint32_t dc = dataCount, framesPerNote = 4 * DIVS[divIdx];
   if (dc - lastData >= framesPerNote) {
     lastData = dc - (dc - lastData) % framesPerNote;
-    if (layerOn[L_TRAFFIC] && now - lastArp >= 90) {
-      static const int ARP[8] = {0, 1, 2, 3, 2, 1, 3, 2};
-      int i = ARP[arp % 8]; int up = (arp / 8) % 2 ? 12 : 0; arp++;
-      float f = fold(semi(chordTone(i) + 12 + up), 260, 1400);
-      schedule(now, f, 0.11f * lvl(L_TRAFFIC), T_VIBES, LENS[lenIdx], L_TRAFFIC, -1);
-      lastArp = now;
+    if (layerOn[L_TRAFFIC] && now - lastTraffic >= 70) {
+      float r = dataRssi, nr = nearness(r);
+      float f = fold(fundamental() * harmonic(r, 3, 16), 110, 2000);
+      float len = 0.4f + 2.0f * constrain(dataLen / 1500.0f, 0.0f, 1.0f);
+      if (play(f, (0.03f + 0.14f * nr) * lvl(L_TRAFFIC), T_VIBES, len, 0.3f + 1.2f * nr)) layerFlash[L_TRAFFIC] = now;
+      lastTraffic = now;
     }
   }
 
-  // floor: the drone follows the chord root and swells with the noise floor
-  float nf = constrain((noiseFloor + 97) / 15.0f, 0.0f, 1.0f);
-  droneRoot = fold(semi(chordTone(0)), 130, 260);
-  droneTarget = muted ? 0 : (0.6f + 0.4f * nf) * 0.05f * lvl(L_FLOOR);
-  static int lastNf = -95;                                    // the floor row flashes when the noise floor shifts
-  if (abs(noiseFloor - lastNf) >= 2) { lastNf = noiseFloor; if (layerOn[L_FLOOR]) layerFlash[L_FLOOR] = now; }
-
-  // deauth: a struck bell chord the moment a disconnect frame is heard
+  // deauth: a struck bell the moment a disconnect frame is heard, pitched by its strength
   uint32_t dd = deauthCount;
   if (dd != lastDeauth) {
     lastDeauth = dd;
-    if (layerOn[L_DEAUTH] && now - lastBell > 4000) {         // root, fifth, octave
-      float a = 0.07f * lvl(L_DEAUTH);
-      schedule(now, fold(semi(chordTone(0) + 12), 196, 700), a, T_BELL, 1.0f, L_DEAUTH, -1);
-      schedule(now, fold(semi(chordTone(2) + 12), 196, 1000), a * 0.8f, T_BELL, 1.0f, L_DEAUTH, -1);
-      schedule(now, fold(semi(chordTone(0) + 24), 300, 1400), a * 0.6f, T_BELL, 1.0f, L_DEAUTH, -1);
+    if (layerOn[L_DEAUTH] && now - lastBell > 2500) {
+      float r = deauthRssi, nr = nearness(r);
+      float f = fold(fundamental() * 2.0f * harmonic(r, 2, 8), 110, 1400);
+      if (play(f, (0.05f + 0.1f * nr) * lvl(L_DEAUTH), T_BELL, 1.0f, 0.5f + nr)) layerFlash[L_DEAUTH] = now;
       lastBell = now;
     }
   }
 
-  // motion: a shake strums the current chord upward
-  static uint32_t lastImu = 0;
-  if (imuOk && now - lastImu >= 30) {
-    lastImu = now;
-    M5.Imu.update();
-    float ax, ay, az; M5.Imu.getAccel(&ax, &ay, &az);
-    float dev = fabsf(sqrtf(ax * ax + ay * ay + az * az) - 1.0f);
-    shake = max(shake * 0.8f, dev);
-    if (layerOn[L_MOTION] && shake > 0.35f && now - lastStrum > 700) {
-      float a = (0.06f + 0.05f * min(shake, 1.5f)) * lvl(L_MOTION);
-      for (int i = 0; i < 6; i++) {
-        float f = fold(semi(chordTone(i % 4) + 12 + 12 * (i / 4)), 196, 1400);
-        schedule(now + i * 45, f, a, T_KALIMBA, 1.2f, L_MOTION, -1);
-      }
-      lastStrum = now;
-    }
+  // floor: drone loudness = noise floor; one harmonic per device present
+  static uint32_t lastCount = 0;
+  if (now - lastCount > 250) {
+    lastCount = now;
+    int n = 0;
+    for (int i = 0; i < NV; i++) if (voices[i].used && now - voices[i].seen < 5000) n++;
+    present = n;
   }
-
-  // release everything whose step has arrived
-  for (int i = 0; i < NS; i++) {
-    Sched& s = sched[i];
-    if (!s.used || s.at > now) continue;
-    play(s.f, s.amp, s.timbre, s.len);
-    layerFlash[s.layer] = now;
-    if (s.voice >= 0) voices[s.voice].flash = now;
-    s.used = false;
-  }
+  float nf = constrain((noiseFloor + 100) / 20.0f, 0.0f, 1.0f);
+  droneF0 = fundamental();
+  dronePartials = constrain(present, 1, 8);
+  droneLevel = muted ? 0 : (0.015f + 0.04f * nf) * lvl(L_FLOOR);
+  static int lastNf = -95;
+  if (abs(noiseFloor - lastNf) >= 2) { lastNf = noiseFloor; if (layerOn[L_FLOOR]) layerFlash[L_FLOOR] = now; }
 
   // bluetooth: scan in short windows so memory never grows
   if (layerOn[L_BLE] && !bleScanning) {

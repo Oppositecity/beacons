@@ -1,4 +1,4 @@
-// BEACONS v1.1 — listening to the air, for M5Stack Cardputer (original + ADV)
+// BEACONS v1.2 — listening to the air, for M5Stack Cardputer (original + ADV)
 //
 // Nothing here is composed. Every sound is a measurement:
 //   when a note sounds  = the moment a signal arrives
@@ -24,6 +24,10 @@
 //   metal     gamelan   bright    glass       bell    low gong
 //   skin      drum      kalimba   woodblock   bell    low drum
 //   glass     glass     bright    vibraphone  bell    tongue drum
+//   air       sustained tones: the nearest eight devices each hold a tone at their pitch,
+//             gliding as you move; each ping swells, wobbles and thickens it. Two tones near
+//             the same pitch beat at a rate set by how differently they're moving.
+//             data and deauth stay struck (vibraphone, bell).
 //
 // Pitches stay within 110–2000 Hz, the output passes a soft limiter, and volume is capped.
 //
@@ -59,7 +63,7 @@ enum { L_BEACON, L_PROBE, L_TRAFFIC, L_FLOOR, L_DEAUTH, L_BLE, NLAYERS };
 enum { T_MARIMBA, T_KALIMBA, T_TONGUE, T_VIBES, T_BELL, T_GLASS, T_BRIGHT, T_GAMELAN, T_GONG, T_DRUM, T_BLOCK, T_LOWDRUM, NTIMBRES };
 struct Ev { uint8_t kind; uint8_t mac[6]; int8_t rssi; char name[33]; };   // kind 0 AP, 1 probe, 2 BLE
 struct Partial { float a1, a2, y1, y2, env, rblk; };
-struct Note { Partial p[3]; int np; bool active; };
+struct Note { Partial p[3]; int np; bool active; int age; };
 struct NoteEv { float f, amp, len, bright; uint8_t timbre; };
 struct Voice {
   uint8_t mac[6]; char s[33]; uint8_t kind; float rssi, rssiSlow;
@@ -79,13 +83,15 @@ static bool muted    = false;
 static bool hopping  = false;
 static int  hopDir   = 1;
 static int  kit      = 0;
-static const char* KIT_NAMES[] = {"wood", "metal", "skin", "glass"};
+static const char* KIT_NAMES[] = {"wood", "metal", "skin", "glass", "air"};
+static const int AIR = 4, NKITS = 5;
 // which timbre voices each layer, per kit: aps, probes, data, floor (unused), deauth, ble
-static const uint8_t KIT[4][NLAYERS] = {
+static const uint8_t KIT[NKITS][NLAYERS] = {
   {T_MARIMBA, T_KALIMBA, T_VIBES, 0, T_BELL, T_TONGUE},
   {T_GAMELAN, T_BRIGHT,  T_GLASS, 0, T_BELL, T_GONG},
   {T_DRUM,    T_KALIMBA, T_BLOCK, 0, T_BELL, T_LOWDRUM},
   {T_GLASS,   T_BRIGHT,  T_VIBES, 0, T_BELL, T_TONGUE},
+  {T_GLASS,   T_BRIGHT,  T_VIBES, 0, T_BELL, T_TONGUE},     // air: device layers are sustained instead
 };
 static int  volume   = 120;
 static const int VOL_MAX = 200;                // hard cap for ears and equipment
@@ -187,7 +193,7 @@ static float pitchFor(const Voice& v) {
 // =====================================================================
 //  synthesis engine — modal resonators in their own task
 // =====================================================================
-static const int SR = 22050, BLK = 256;
+static const int SR = 22050, BLK = 512;          // 23 ms per buffer, two queued: room to breathe
 static const int NNOTES = 24;
 static Note notes[NNOTES];
 static const int NQ = 32;
@@ -255,12 +261,32 @@ static void startNote(const NoteEv& e) {
     p.y1 = A * sinf(w); p.y2 = 0;                     // starts at zero crossing: no click
     p.env = A; p.rblk = powf(rr, BLK);
   }
+  n.age = 0;
   n.active = n.np > 0;
 }
+
+static const int RAMP = 88;                          // 4 ms at 22050 Hz
+
+// air kit: up to eight sustained tones, one per nearby device
+static const int NSUS = 8;
+static volatile float susF[NSUS], susA[NSUS];        // target pitch and loudness, set by the loop
+static volatile bool  susPing[NSUS];                 // set by the loop when that device pings
+static int susVoice[NSUS] = {-1, -1, -1, -1, -1, -1, -1, -1};
 
 // drone (floor layer): harmonics of the channel's fundamental, one per device present
 static volatile float droneLevel = 0, droneF0 = 73.4f;
 static volatile int dronePartials = 1;
+
+// sine by table lookup: the sustained tones and drone call this ~700k times a second
+static const int SINN = 1024;
+static float SINT[SINN + 1];
+static void initSin() { for (int i = 0; i <= SINN; i++) SINT[i] = sinf(2 * PI * i / SINN); }
+static inline float fsin(float ph) {                 // ph in [0, 2pi)
+  float x = ph * (SINN / (2 * PI));
+  int i = (int)x; if (i >= SINN) i = SINN - 1;
+  float fr = x - i;
+  return SINT[i] + (SINT[i + 1] - SINT[i]) * fr;
+}
 
 static float softclip(float x) {
   if (x > 3) x = 3; else if (x < -3) x = -3;
@@ -273,6 +299,9 @@ static float mix[BLK];
 static void synthTask(void*) {
   int ob = 0;
   float ph[8] = {0}, g[8] = {0}, f0s = 73.4f, lfo = 0;
+  float sf[NSUS], sa[NSUS] = {0}, sp[NSUS] = {0}, sph[NSUS] = {0}, sph2[NSUS] = {0}, svph[NSUS] = {0};
+  for (int i = 0; i < NSUS; i++) sf[i] = 220;
+  const float pingDecay = expf(-1.0f / (0.3f * SR));   // a ping fades over about a third of a second
   for (;;) {
     if (M5Cardputer.Speaker.isPlaying(0) >= 2) { vTaskDelay(1); continue; }
 
@@ -291,14 +320,17 @@ static void synthTask(void*) {
       for (int k = 0; k < n.np; k++) {
         Partial& p = n.p[k];
         float y1 = p.y1, y2 = p.y2, a1 = p.a1, a2 = p.a2;
+        int age = n.age;
         for (int s = 0; s < BLK; s++) {
           float y = a1 * y1 + a2 * y2;
           y2 = y1; y1 = y;
-          mix[s] += y;
+          int a = age + s;
+          mix[s] += (a < RAMP) ? y * a / (float)RAMP : y;   // 4 ms fade-in: a strike, not a click
         }
         p.y1 = y1; p.y2 = y2; p.env *= p.rblk;
         if (p.env > 1e-4f) alive = true;
       }
+      n.age += BLK;
       n.active = alive;
     }
 
@@ -309,15 +341,32 @@ static void synthTask(void*) {
     for (int s = 0; s < BLK; s++) {
       f0s += (ft - f0s) * 0.0002f;
       lfo += 2 * PI * 0.07f / SR; if (lfo > 2 * PI) lfo -= 2 * PI;
-      float breath = 0.75f + 0.25f * sinf(lfo), acc = 0;
+      float breath = 0.75f + 0.25f * fsin(lfo), acc = 0;
       for (int k = 0; k < 8; k++) {
         g[k] += (tg[k] - g[k]) * 0.0002f;
         float fk = f0s * 2.0f * (k + 1);                // start an octave above the fundamental
         if (fk > 2000) continue;
         ph[k] += 2 * PI * fk / SR; if (ph[k] > 2 * PI) ph[k] -= 2 * PI;
-        if (g[k] > 1e-5f) acc += g[k] * sinf(ph[k]);
+        if (g[k] > 1e-5f) acc += g[k] * fsin(ph[k]);
       }
       mix[s] += breath * acc;
+    }
+
+    // air kit: sustained tones glide to their device's pitch; a ping swells, wobbles and thickens
+    for (int i = 0; i < NSUS; i++) {
+      if (susPing[i]) { susPing[i] = false; sp[i] = 1.0f; }
+      float ft = susF[i], at = susA[i];
+      if (at < 1e-5f && sa[i] < 1e-5f) { sa[i] = 0; sf[i] = ft; continue; }
+      for (int s = 0; s < BLK; s++) {
+        sf[i] += (ft - sf[i]) * 0.0004f;
+        sa[i] += (at - sa[i]) * 0.0003f;
+        sp[i] *= pingDecay;
+        svph[i] += 2 * PI * 5.5f / SR; if (svph[i] > 2 * PI) svph[i] -= 2 * PI;
+        float inc = 2 * PI * sf[i] * (1.0f + 0.012f * sp[i] * fsin(svph[i])) / SR;
+        sph[i] += inc;      if (sph[i] > 2 * PI) sph[i] -= 2 * PI;
+        sph2[i] += 2 * inc; if (sph2[i] > 2 * PI) sph2[i] -= 2 * PI;
+        mix[s] += sa[i] * (1.0f + 0.7f * sp[i]) * (fsin(sph[i]) + (0.12f + 0.5f * sp[i]) * fsin(sph2[i]));
+      }
     }
 
     int16_t* o = outbuf[ob];
@@ -404,7 +453,7 @@ static void handleKeys() {
     else if (c == 'z') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
     else if (c == 'x') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
     else if (c == 'm') muted = !muted;
-    else if (c == 'k') kit = (kit + 1) % 4;
+    else if (c == 'k') kit = (kit + 1) % NKITS;
     else if (c == 'o') goToSleep();
   }
 }
@@ -513,6 +562,7 @@ void setup() {
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Speaker.setVolume(volume);
   canvas.createSprite(240, 135);
+  initSin();
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -548,7 +598,11 @@ void loop() {
     float nr = nearness(v.rssi);
     float amp = 0.04f + 0.24f * nr, bright = 0.3f + 1.3f * nr, len = 0.5f + 1.5f * nr;
     bool sounded = false;
-    if (e.kind == 0) {
+    if (kit == AIR) {                                         // air: a ping swells that device's tone
+      if (e.kind == 0 && (++v.n % DIVS[divIdx])) continue;
+      if (e.kind != 0 && now - v.lastSound < (e.kind == 1 ? 400u : 60u * DIVS[divIdx])) continue;
+      for (int i = 0; i < NSUS; i++) if (susVoice[i] == vi) { susPing[i] = true; sounded = true; }
+    } else if (e.kind == 0) {
       if (++v.n % DIVS[divIdx]) continue;                    // each AP on its own real clock, thinned
       sounded = play(pitchFor(v), amp * lvl(L_BEACON), KIT[kit][L_BEACON], len, bright);
     } else if (e.kind == 1) {
@@ -585,6 +639,43 @@ void loop() {
       float f = fold(fundamental() * 2.0f * harmonic(r, 2, 8), 110, 1400);
       if (play(f, (0.05f + 0.1f * nr) * lvl(L_DEAUTH), KIT[kit][L_DEAUTH], 1.0f, 0.5f + nr)) layerFlash[L_DEAUTH] = now;
       lastBell = now;
+    }
+  }
+
+  // air kit: give the nearest eight devices a sustained tone; keep a tone with its device while it stays near
+  static uint32_t lastSus = 0;
+  if (now - lastSus > 100) {
+    lastSus = now;
+    bool want[NV] = {false};
+    if (kit == AIR && !muted)
+      for (int r = 0; r < NSUS; r++) {
+        int best = -1;
+        for (int i = 0; i < NV; i++) {
+          Voice& v = voices[i];
+          if (!v.used || want[i] || now - v.seen > 5000) continue;
+          int L = v.kind == 0 ? L_BEACON : (v.kind == 1 ? L_PROBE : L_BLE);
+          if (!layerOn[L]) continue;
+          if (best < 0 || v.rssi > voices[best].rssi) best = i;
+        }
+        if (best < 0) break;
+        want[best] = true;
+      }
+    for (int i = 0; i < NSUS; i++) if (susVoice[i] >= 0 && !want[susVoice[i]]) susVoice[i] = -1;   // let it fade
+    for (int vi = 0; vi < NV; vi++) {
+      if (!want[vi]) continue;
+      int slot = -1;
+      for (int i = 0; i < NSUS; i++) if (susVoice[i] == vi) slot = i;
+      if (slot < 0) for (int i = 0; i < NSUS; i++) if (susVoice[i] < 0 && susA[i] < 1e-5f) { slot = i; break; }
+      if (slot < 0) for (int i = 0; i < NSUS; i++) if (susVoice[i] < 0) { slot = i; break; }
+      if (slot >= 0) susVoice[slot] = vi;
+    }
+    for (int i = 0; i < NSUS; i++) {
+      if (susVoice[i] < 0) { susA[i] = 0; continue; }
+      Voice& v = voices[susVoice[i]];
+      int L = v.kind == 0 ? L_BEACON : (v.kind == 1 ? L_PROBE : L_BLE);
+      float nr = nearness(v.rssi);
+      susF[i] = pitchFor(v);
+      susA[i] = (0.006f + 0.06f * nr * nr) * lvl(L);
     }
   }
 

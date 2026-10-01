@@ -1,4 +1,4 @@
-// BEACONS v1.2 — listening to the air, for M5Stack Cardputer (original + ADV)
+// BEACONS v1.3 — listening to the air, for M5Stack Cardputer (original + ADV)
 //
 // Nothing here is composed. Every sound is a measurement:
 //   when a note sounds  = the moment a signal arrives
@@ -29,7 +29,8 @@
 //             the same pitch beat at a rate set by how differently they're moving.
 //             data and deauth stay struck (vibraphone, bell).
 //
-// Pitches stay within 110–2000 Hz, the output passes a soft limiter, and volume is capped.
+// Pitches stay within 110–2000 Hz and the output passes a soft limiter. The speaker library's own
+// 16x boost is switched off (it was clipping every struck note), so nothing past the limiter can clip.
 //
 // Each layer's loudness is fixed, so loudness only ever means signal strength.
 //
@@ -93,8 +94,8 @@ static const uint8_t KIT[NKITS][NLAYERS] = {
   {T_GLASS,   T_BRIGHT,  T_VIBES, 0, T_BELL, T_TONGUE},
   {T_GLASS,   T_BRIGHT,  T_VIBES, 0, T_BELL, T_TONGUE},     // air: device layers are sustained instead
 };
-static int  volume   = 120;
-static const int VOL_MAX = 200;                // hard cap for ears and equipment
+static int  volume   = 180;                    // with the library boost off, 255 = unity: the limiter is the ceiling
+static const int VOL_MAX = 255;
 static int  divIdx   = 3;
 static const int DIVS[] = {1, 2, 5, 10, 20, 50};
 static int  present  = 0;                      // devices heard in the last 5 s
@@ -450,8 +451,8 @@ static void handleKeys() {
     else if (c == 's') hopping = !hopping;
     else if (c == 'f') divIdx = min(divIdx + 1, 5);
     else if (c == 'g') divIdx = max(divIdx - 1, 0);
-    else if (c == 'z') { volume = max(volume - 20, 0);       M5Cardputer.Speaker.setVolume(volume); }
-    else if (c == 'x') { volume = min(volume + 20, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
+    else if (c == 'z') { volume = max(volume - 25, 0);       M5Cardputer.Speaker.setVolume(volume); }
+    else if (c == 'x') { volume = min(volume + 25, VOL_MAX); M5Cardputer.Speaker.setVolume(volume); }
     else if (c == 'm') muted = !muted;
     else if (c == 'k') kit = (kit + 1) % NKITS;
     else if (c == 'o') goToSleep();
@@ -560,6 +561,13 @@ static void draw() {
 void setup() {
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
+  // the library multiplies output 16x by default, tuned for quiet beeps; our signal is already full
+  // strength, so that boost clipped every note. At 1x, our soft limiter is the only ceiling.
+  M5Cardputer.Speaker.end();
+  auto spk = M5Cardputer.Speaker.config();
+  spk.magnification = 1;
+  M5Cardputer.Speaker.config(spk);
+  M5Cardputer.Speaker.begin();
   M5Cardputer.Speaker.setVolume(volume);
   canvas.createSprite(240, 135);
   initSin();
